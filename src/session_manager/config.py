@@ -71,6 +71,9 @@ LOCK_FILE_NAME = f"{BACKEND}_session.lock"
 # Both window managers keep the i3 scratchpad workspace name.
 SCRATCHPAD_WORKSPACE = "__i3_scratch"
 SCRATCH_RESTORE_WORKSPACE = "__scratch_restore"
+# Visible windows are materialized here before they are placed. i3 refuses
+# names that start with "__", so this one must stay a normal workspace name.
+RESTORE_STAGING_WORKSPACE = "_session_restore"
 
 DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600
@@ -173,6 +176,10 @@ DEFAULT_APP_PROFILE: AppProfile = {
     "timeout": 20.0,
     "singleton": False,
 }
+
+# How many saved windows restore launches at once. This bounds process
+# fan-out; app-identity launches are serialized per app regardless.
+MATERIALIZE_WORKERS = 4
 
 # Shared timeouts for the waits other modules perform.
 TERMINAL_WAIT_TIMEOUT = 15.0

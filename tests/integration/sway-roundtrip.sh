@@ -44,16 +44,31 @@ export SWAYSOCK
 export WAYLAND_DISPLAY=wayland-1
 echo "sway: $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])')"
 
-# Workspace 1 gets a tiled terminal. Workspace 2 gets a floating one.
+# Workspace 1 gets three tiled terminals in a nested split. Workspace 2 gets
+# a floating one. The nested shape is what the arrangement walk has to
+# reproduce after the windows are materialized concurrently.
 swaymsg 'workspace 1' >/dev/null
 foot -T alpha -e sleep 600 >/tmp/foot-alpha.log 2>&1 &
 sleep 2
-swaymsg 'workspace 2' >/dev/null
 foot -T beta -e sleep 600 >/tmp/foot-beta.log 2>&1 &
 sleep 2
-swaymsg '[title="^beta$"] floating enable' >/dev/null
-swaymsg '[title="^beta$"] resize set 600 400' >/dev/null
-swaymsg '[title="^beta$"] move position 100 100' >/dev/null
+swaymsg '[title="^beta$"] focus' >/dev/null
+swaymsg 'split v' >/dev/null
+foot -T gamma -e sleep 600 >/tmp/foot-gamma.log 2>&1 &
+sleep 2
+swaymsg 'workspace 2' >/dev/null
+foot -T delta -e sleep 600 >/tmp/foot-delta.log 2>&1 &
+sleep 2
+swaymsg '[title="^delta$"] floating enable' >/dev/null
+swaymsg '[title="^delta$"] resize set 600 400' >/dev/null
+swaymsg '[title="^delta$"] move position 100 100' >/dev/null
+sleep 1
+
+# A hidden scratchpad window must still be parked out of sight after restore.
+swaymsg 'workspace 1' >/dev/null
+foot -T epsilon -e sleep 600 >/tmp/foot-epsilon.log 2>&1 &
+sleep 2
+swaymsg '[title="^epsilon$"] move scratchpad' >/dev/null
 sleep 1
 
 python3 -m session_manager save --quiet
@@ -62,13 +77,25 @@ echo "saved sway state"
 python3 - <<'PY'
 import json, pathlib
 payload = json.loads(pathlib.Path('/tmp/state/sway_session.json').read_text())
-windows = [
-    (ws['name'], n['app_id'], n['rect'])
-    for ws in payload['workspaces']
-    for n in ws['nodes'] + ws['floating_nodes']
-]
-assert len(windows) == 2, windows
+
+windows = []
+def walk(node, workspace):
+    if node.get('type') == 'window':
+        windows.append((workspace, node['app_id'], node['rect']))
+    for child in node.get('nodes', []) + node.get('floating_nodes', []):
+        walk(child, workspace)
+
+for ws in payload['workspaces']:
+    for child in ws['nodes'] + ws['floating_nodes']:
+        walk(child, ws['name'])
+
+assert len(windows) == 4, windows
 assert {w[0] for w in windows} == {'1', '2'}, windows
+
+ws1 = next(ws for ws in payload['workspaces'] if ws['name'] == '1')
+nested = [n for n in ws1['nodes'] if n.get('type') == 'con' and n.get('nodes')]
+assert nested, ws1
+assert len(payload.get('hidden_scratchpad', [])) == 1, payload.get('hidden_scratchpad')
 print('saved windows:', windows)
 PY
 

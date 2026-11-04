@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import APP_WAIT_TIMEOUT
@@ -18,7 +19,7 @@ def get_mpv_info(pid: int) -> str:
     return ""
 
 
-def launch_mpv(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_mpv(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch mpv and return its window id."""
     from .generic import wait_for_window_by_pid
 

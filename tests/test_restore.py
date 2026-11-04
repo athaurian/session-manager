@@ -378,9 +378,11 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
                 unittest.mock.patch.object(self.restore_mod, "restore_background_apps"),
                 unittest.mock.patch.object(self.restore_mod, "close_connection"),
                 unittest.mock.patch.object(self.restore_mod, "ProcCache"),
-                # The thread would launch a browser; the ordering test only
+                # The browser would launch here; the ordering test only
                 # needs the workspace walk.
-                unittest.mock.patch.object(self.restore_mod, "start_helium_restore"),
+                unittest.mock.patch.object(
+                    self.restore_mod, "_start_helium_materialization"
+                ),
             ]
             for p in extra:
                 p.start()
@@ -419,7 +421,11 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
             "background_apps": [],
         }
         self._run_locked(payload, focused="1")
-        switches = [c for c in self.calls if c.startswith("workspace ")]
+        switches = [
+            c
+            for c in self.calls
+            if c.startswith("workspace ") and "_session_restore" not in c
+        ]
         self.assertEqual(switches[0], "workspace 2")
         self.assertLess(switches.index("workspace 2"), switches.index("workspace 1"))
 
@@ -475,7 +481,9 @@ class TestBackgroundRestoreOrder(RestoreHarnessTestCase):
                 ),
                 unittest.mock.patch.object(self.restore_mod, "close_connection"),
                 unittest.mock.patch.object(self.restore_mod, "ProcCache"),
-                unittest.mock.patch.object(self.restore_mod, "start_helium_restore"),
+                unittest.mock.patch.object(
+                    self.restore_mod, "_start_helium_materialization"
+                ),
                 unittest.mock.patch.object(
                     self.restore_mod,
                     "notify",

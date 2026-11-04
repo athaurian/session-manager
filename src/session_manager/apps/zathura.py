@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import (
@@ -69,7 +70,7 @@ def get_zathura_info(pid: int) -> tuple[str, int]:
     return "", 0
 
 
-def launch_zathura(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_zathura(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch zathura and return its window id."""
     from .generic import wait_for_window_by_pid
 

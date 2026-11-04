@@ -148,7 +148,7 @@ def _live_new_helium_windows(baseline_ids: set[int]) -> dict[int, str]:
     return result
 
 
-def _restore_helium_group(ctx: RestoreContext) -> None:
+def restore_helium_group(ctx: RestoreContext) -> None:
     """Restore the saved Helium window group."""
     if ctx.helium_restore_started:
         return
@@ -378,7 +378,7 @@ def start_helium_restore(ctx: RestoreContext) -> None:
     def run() -> None:
         """Restore the group and log any failures."""
         try:
-            _restore_helium_group(ctx)
+            restore_helium_group(ctx)
         except Exception:
             log.exception("Helium restore failed")
 
@@ -392,7 +392,7 @@ def get_helium_restored_id(node: dict, ctx: RestoreContext) -> int | None:
     if ctx.helium_thread is not None:
         ctx.helium_thread.join()
     elif not ctx.helium_restore_started:
-        _restore_helium_group(ctx)
+        restore_helium_group(ctx)
     idx = ctx.helium_saved_index.get(id(node))
     if idx is None:
         return None

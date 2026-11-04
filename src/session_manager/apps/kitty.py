@@ -6,6 +6,7 @@ import logging
 import os
 import shlex
 import subprocess
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import (
@@ -139,7 +140,7 @@ def build_kitty_command(node: dict, *, drop: bool = False) -> list[str]:
 
 
 def launch_kitty(
-    node: dict, claimed_ids: set[int], *, drop: bool = False
+    node: dict, claimed_ids: MutableSet[int], *, drop: bool = False
 ) -> int | None:
     """Launch a kitty terminal and return its window id."""
     from .generic import wait_for_window_by_pid
@@ -167,6 +168,6 @@ def launch_kitty(
     return None
 
 
-def launch_kitty_drop(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_kitty_drop(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch the dropdown terminal and return its window id."""
     return launch_kitty(node, claimed_ids, drop=True)

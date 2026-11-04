@@ -6,6 +6,7 @@ import logging
 import shlex
 import subprocess
 import time
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import (
@@ -68,7 +69,7 @@ def find_unclaimed_window(
     class_name: str,
     baseline_ids: set[int] | None = None,
     reject_floating: bool = False,
-    claimed_ids: set[int] | None = None,
+    claimed_ids: MutableSet[int] | None = None,
 ) -> int | None:
     """Return an unclaimed live window that matches an app identity."""
     baseline = baseline_ids or set()
@@ -110,7 +111,7 @@ def wait_for_app_window(
     reject_floating: bool = False,
     timeout: float = 20.0,
     baseline_ids: set[int] | None = None,
-    claimed_ids: set[int] | None = None,
+    claimed_ids: MutableSet[int] | None = None,
     process: object | None = None,
     fail_fast_on_exit: bool = False,
 ) -> int | None:
@@ -235,7 +236,7 @@ def wait_for_window_by_pid(
     return _window_with_pid(pid, app_id)
 
 
-def launch_and_get_id(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch or locate the window for a saved node."""
     from .calibre import launch_ebook_viewer
     from .kitty import launch_kitty, launch_kitty_drop

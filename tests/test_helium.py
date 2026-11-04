@@ -99,7 +99,7 @@ class HeliumTestCase(unittest.TestCase):
             ctx.helium_saved_nodes.append(node)
             ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
             ctx.helium_restored_ids.append(None)
-        return ctx, helium_mod._restore_helium_group(ctx)
+        return ctx, helium_mod.restore_helium_group(ctx)
 
 
 class TestHeliumGuard(HeliumTestCase):
@@ -111,7 +111,7 @@ class TestHeliumGuard(HeliumTestCase):
 
     def test_sets_started_without_saved_nodes(self):
         ctx = RestoreContext()
-        helium_mod._restore_helium_group(ctx)
+        helium_mod.restore_helium_group(ctx)
         self.assertTrue(ctx.helium_restore_started)
         self.assertEqual(len(FakePopen.instances), 0)
 
@@ -119,7 +119,7 @@ class TestHeliumGuard(HeliumTestCase):
         self.watcher_events = [ev("new", 72, name="tab a")]
         ctx, _ = self.run_group([make_window("helium", name="tab a")])
         launches = len(FakePopen.instances)
-        helium_mod._restore_helium_group(ctx)
+        helium_mod.restore_helium_group(ctx)
         self.assertEqual(len(FakePopen.instances), launches)
 
 
@@ -210,7 +210,7 @@ class TestHeliumEarlyReuse(HeliumTestCase):
                 ctx.helium_saved_nodes.append(node)
                 ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
                 ctx.helium_restored_ids.append(None)
-            helium_mod._restore_helium_group(ctx)
+            helium_mod.restore_helium_group(ctx)
 
         self.assertEqual(len(FakePopen.instances), 0)
         self.assertEqual(sorted(ctx.helium_restored_ids), [91, 92])
@@ -229,7 +229,7 @@ class TestHeliumEarlyReuse(HeliumTestCase):
             ctx.helium_saved_nodes.append(saved[0])
             ctx.helium_saved_index[id(saved[0])] = 0
             ctx.helium_restored_ids.append(None)
-            helium_mod._restore_helium_group(ctx)
+            helium_mod.restore_helium_group(ctx)
 
         self.assertEqual(ctx.helium_restored_ids, [93])
 
@@ -256,9 +256,7 @@ class TestHeliumBackgroundStart(HeliumTestCase):
             context.helium_restore_started = True
             context.helium_restored_ids[0] = 99
 
-        with unittest.mock.patch.object(
-            helium_mod, "_restore_helium_group", slow_group
-        ):
+        with unittest.mock.patch.object(helium_mod, "restore_helium_group", slow_group):
             helium_mod.start_helium_restore(ctx)
             self.assertIsNotNone(ctx.helium_thread)
             self.assertEqual(helium_mod.get_helium_restored_id(node, ctx), 99)

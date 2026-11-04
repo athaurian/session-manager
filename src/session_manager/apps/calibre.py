@@ -7,6 +7,7 @@ import logging
 import re
 import sqlite3
 import subprocess
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import APP_PROFILES, CALIBRE_CONFIG, CALIBRE_DB
@@ -114,7 +115,7 @@ def get_ebook_viewer_document(title: str, fmt: str) -> str | None:
     return _resolve_calibre_document_from_library(title, fmt)
 
 
-def launch_ebook_viewer(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_ebook_viewer(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch the ebook viewer and return its window id."""
     from .generic import wait_for_app_window
 

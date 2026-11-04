@@ -6,25 +6,29 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from collections.abc import Iterator
+from functools import partial
 from typing import Any
 
 from .apps.generic import launch_and_get_id
 from .apps.helium import (
     collect_helium_nodes,
     get_helium_restored_id,
-    start_helium_restore,
+    restore_helium_group,
 )
 from .background import restore_background_apps
 from .config import (
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     FLOAT_GEOMETRY_RETRY_DELAY,
+    RESTORE_STAGING_WORKSPACE,
     SCRATCH_RESTORE_WORKSPACE,
     SCRATCHPAD_WORKSPACE,
     STATE_DIR,
     STATE_FILE,
+    canonical_app_id,
     detect_backend,
 )
 from .ipc import (
@@ -132,6 +136,85 @@ def _iter_windows(node: dict) -> Iterator[dict]:
         yield from _iter_windows(child)
 
 
+# Launchers that wait for the window owned by the process they started. Those
+# are safe to run concurrently even for the same application.
+_PID_MATCHED = frozenset({"kitty", "kitty_drop", "thunar", "mpv", "org.pwmt.zathura"})
+
+
+def _launch_units(nodes: list[dict]) -> list[list[dict]]:
+    """Group saved nodes into independent launch units.
+
+    A unit launches once. Windows matched by pid are independent, so each
+    gets its own unit and they all start together. Windows matched by app
+    identity share one unit per app: two concurrent launches of the same app
+    could otherwise claim each other's window.
+    """
+    units: dict[tuple[str, ...], list[dict]] = {}
+    for node in nodes:
+        app_id = canonical_app_id(node_app_id(node))
+        if app_id == "helium":
+            # The browser restores all its windows as one group.
+            continue
+        key: tuple[str, ...]
+        if app_id in _PID_MATCHED:
+            key = ("node", str(id(node)))
+        else:
+            key = ("app", app_id, str(node.get("class", "")))
+        units.setdefault(key, []).append(node)
+    return list(units.values())
+
+
+def _run_launch_unit(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Launch one unit's windows and record the ids they came back with."""
+    for node in nodes:
+        try:
+            win_id = launch_and_get_id(node, ctx.claimed_ids)
+        except Exception as exc:
+            log.exception("Failed to launch %s", _failure_label(node))
+            ctx.add_failure(f"{_failure_label(node)}: {exc}")
+            win_id = None
+        ctx.registry.record(node, win_id)
+
+
+def _start_materialization(
+    nodes: list[dict], ctx: RestoreContext
+) -> list[threading.Event]:
+    """Start launches for `nodes` and return one completion event per unit."""
+    events: list[threading.Event] = []
+    for unit in _launch_units(nodes):
+        events.append(ctx.registry.submit(unit, partial(_run_launch_unit, unit, ctx)))
+    return events
+
+
+def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Launch every window in `nodes` and wait before anything is placed.
+
+    Waiting matters: a window that maps while the walk is issuing `split` or
+    `layout` can steal focus and reshape the wrong container.
+    """
+    for event in _start_materialization(nodes, ctx):
+        event.wait()
+
+
+def _run_helium_unit(ctx: RestoreContext) -> None:
+    """Restore the saved browser group and publish each window's id."""
+    try:
+        restore_helium_group(ctx)
+    except Exception:
+        log.exception("Helium restore failed")
+    finally:
+        for idx, node in enumerate(ctx.helium_saved_nodes):
+            ctx.registry.record(node, ctx.helium_restored_ids[idx])
+
+
+def _start_helium_materialization(ctx: RestoreContext) -> None:
+    """Start the browser group restore alongside the other launches."""
+    if ctx.helium_materialized or not ctx.helium_saved_nodes:
+        return
+    ctx.helium_materialized = True
+    ctx.registry.submit(list(ctx.helium_saved_nodes), partial(_run_helium_unit, ctx))
+
+
 def _window_workspace_name(win_id: int) -> str | None:
     """Return the name of the workspace holding a live window."""
     try:
@@ -152,6 +235,59 @@ def _window_workspace_name(win_id: int) -> str | None:
         return None
 
     return _find(tree, None)
+
+
+def _focused_depth_in_workspace(name: str) -> int | None:
+    """Return how many `focus parent` steps reach a workspace root.
+
+    None means the workspace is not in the live tree, so the caller should
+    fall back to a best-effort single step.
+    """
+    try:
+        tree = get_tree()
+    except OSError:
+        return None
+
+    def find_workspace(node: dict) -> dict | None:
+        if node.get("type") == "workspace" and node.get("name") == name:
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = find_workspace(child)
+            if found is not None:
+                return found
+        return None
+
+    def focused_depth(node: dict, depth: int) -> int | None:
+        if node.get("focused"):
+            return depth
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = focused_depth(child, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    workspace = find_workspace(tree)
+    if workspace is None:
+        return None
+    depth = focused_depth(workspace, 0)
+    # An empty workspace is itself focused, which is already the root.
+    return 0 if depth is None else depth
+
+
+def _focus_workspace_root(name: str) -> None:
+    """Focus a workspace container so the next window lands at its root.
+
+    Switching to a workspace focuses its last focused child. Without this, a
+    window placed after a nested container would be moved inside that
+    container instead of beside it. Workspaces cannot be focused by con_id,
+    so walk up from the focused child instead.
+    """
+    depth = _focused_depth_in_workspace(name)
+    if depth is None:
+        run_command("focus parent")
+        return
+    for _ in range(depth):
+        cmd("focus parent")
 
 
 def _ensure_on_workspace(win_id: int, workspace: str | None) -> None:
@@ -181,7 +317,7 @@ def _park_in_scratchpad(win_id: int, node: dict, ctx: RestoreContext) -> None:
             return
         sleep(0.05)
         cmd(f"[con_id={win_id}] move scratchpad")
-    ctx.failures.append(f"{_failure_label(node)}: still visible after move scratchpad")
+    ctx.add_failure(f"{_failure_label(node)}: still visible after move scratchpad")
 
 
 def has_restorable_content() -> bool:
@@ -515,7 +651,14 @@ def _apply_layout(layout: str) -> None:
 
 
 def _resolve_window(node: dict, ctx: RestoreContext) -> int | None:
-    """Launch or locate the window for a saved node."""
+    """Return the live window id for a saved node.
+
+    The normal path reads the id that materialization already resolved. A
+    node that bypassed materialization, such as a hidden scratchpad window
+    launched just before it is parked, falls back to launching on demand.
+    """
+    if ctx.registry.has(node):
+        return ctx.registry.resolve(node)
     if node_app_id(node) == "helium":
         return get_helium_restored_id(node, ctx)
     return launch_and_get_id(node, ctx.claimed_ids)
@@ -526,7 +669,7 @@ def _record_missing(ctx: RestoreContext, node: dict) -> None:
     if node_app_id(node) == "kitty_drop":
         # The dropdown terminal is spawned by its own keybinding on demand.
         return
-    ctx.missing.append(_failure_label(node))
+    ctx.add_missing(_failure_label(node))
 
 
 def _restore_floating(node: dict, ctx: RestoreContext) -> None:
@@ -626,7 +769,7 @@ def _contains_helium(node: dict) -> bool:
 
 def _record_failure(ctx: RestoreContext, node: dict, exc: Exception) -> None:
     """Record a failed window so the rest of the session still restores."""
-    ctx.failures.append(f"{_failure_label(node)}: {exc}")
+    ctx.add_failure(f"{_failure_label(node)}: {exc}")
 
 
 def _restore_child(
@@ -658,15 +801,15 @@ def _restore_node(
     if ntype == "workspace":
         ctx.current_workspace = node["name"]
         cmd(_workspace_cmd(node["name"]))
-        # Focus parent so `layout` targets the workspace even if a floating
-        # window is focused; silent variant avoids noise when already focused.
-        run_command("focus parent")
+        _focus_workspace_root(node["name"])
         _apply_layout(node["layout"])
         for child in node.get("nodes", []):
             cmd(_workspace_cmd(node["name"]))
+            _focus_workspace_root(node["name"])
             _restore_child(child, ctx, parent_layout=node["layout"])
         for child in node.get("floating_nodes", []):
             cmd(_workspace_cmd(node["name"]))
+            _focus_workspace_root(node["name"])
             _restore_floating_child(child, ctx)
 
     elif ntype == "con":
@@ -894,22 +1037,35 @@ def _restore_session_locked(
         for node in hidden_scratchpad:
             collect_helium_nodes(node, ctx)
 
-        # Browser startup overlaps the workspace walk. Helium workspaces go
-        # last so a slow browser cannot hold up the rest of the session.
-        # Window order inside each workspace stays the same.
-        start_helium_restore(ctx)
-        workspaces = sorted(workspaces, key=_contains_helium)
+        def _arrange(group: list[dict]) -> None:
+            """Place a group of workspaces, keeping failures local."""
+            for ws in group:
+                try:
+                    _restore_node(ws, ctx)
+                except Exception as exc:
+                    partial_failures.append(f"{ws.get('name', '?')}: {exc}")
+                    log.exception(
+                        "Partial restore failure in workspace %s", ws.get("name")
+                    )
 
-        for ws in workspaces:
-            try:
-                _restore_node(ws, ctx)
-            except Exception as exc:
-                partial_failures.append(f"{ws.get('name', '?')}: {exc}")
-                log.exception("Partial restore failure in workspace %s", ws.get("name"))
+        # Launch every visible window before placing any of them. A window
+        # that maps mid-walk can steal focus and split the wrong container.
+        # They map on a staging workspace so placement can move each one into
+        # its saved container; a window already on its target workspace would
+        # be left where it is and the nesting would not be rebuilt.
+        visible_windows = [win for ws in workspaces for win in _iter_windows(ws)]
+        if visible_windows:
+            cmd(_workspace_cmd(RESTORE_STAGING_WORKSPACE))
+        _materialize(visible_windows, ctx)
 
-        # Windows that failed on their own are collected here, so the
-        # summary can report them without aborting the session.
-        partial_failures.extend(ctx.failures)
+        # Browser windows map on their own schedule, so they are arranged
+        # after every other workspace and only once the whole group exists.
+        plain = [ws for ws in workspaces if not _contains_helium(ws)]
+        browser = [ws for ws in workspaces if _contains_helium(ws)]
+        _arrange(plain)
+        if browser:
+            _start_helium_materialization(ctx)
+            _arrange(browser)
 
         if hidden_scratchpad and detect_backend() != "i3":
             # Stage geometry on a scratch workspace before parking the windows
@@ -917,12 +1073,20 @@ def _restore_session_locked(
             # so it stays on the restored workspace instead.
             cmd(_workspace_cmd(SCRATCH_RESTORE_WORKSPACE))
         if hidden_scratchpad:
+            # Hidden windows are launched just before they are parked, so they
+            # are not left visible on a normal workspace while the rest of the
+            # session is arranged.
+            _start_helium_materialization(ctx)
             for node in hidden_scratchpad:
                 try:
                     _restore_hidden_scratchpad(node, ctx)
                 except Exception as exc:
                     partial_failures.append(f"hidden scratchpad: {exc}")
                     log.exception("Failed to restore hidden scratchpad window")
+
+        # Windows that failed on their own are collected here, so the
+        # summary can report them without aborting the session.
+        partial_failures.extend(ctx.failures)
 
         cmd(_workspace_cmd(focused_workspace) if focused_workspace else "workspace 1")
 
@@ -931,8 +1095,7 @@ def _restore_session_locked(
         log.exception("Session restore failed.")
         raise
     finally:
-        if ctx.helium_thread is not None and ctx.helium_thread.is_alive():
-            ctx.helium_thread.join(timeout=1.0)
+        ctx.registry.close()
         close_connection()
 
     message = "<b>session restored successfully.</b>"
