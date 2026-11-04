@@ -1,0 +1,11 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        sway foot xwayland x11-utils xdotool xvfb python3 procps \
+        dbus-x11 libgtk-3-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 tester
+
+USER tester
+ENV HOME=/home/tester XDG_RUNTIME_DIR=/tmp/xdg
+CMD ["bash"]

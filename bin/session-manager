@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Session manager entry point."""
+
+import sys
+from pathlib import Path
+
+# Write bytecode caches under ~/.cache instead of next to the checkout.
+sys.pycache_prefix = str(Path.home() / ".cache" / "session-manager" / "pycache")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from session_manager.__main__ import main
+
+main()
