@@ -1,0 +1,4 @@
+#!/bin/sh
+# Record notifications so the runner can time the success message.
+printf '%s %s\n' "$(date +%s%N)" "$*" >> "${NOTIFY_LOG:-/tmp/notify.log}"
+echo 1

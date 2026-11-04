@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+# `make check` and `make format` resolve their on-demand tooling through uv,
+# which refreshes this file in the working tree.
+uv.lock
+.venv/
+dist/
+build/
+*.egg-info/

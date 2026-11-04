@@ -1,0 +1,4 @@
+#!/bin/sh
+# Model a slow generic app: wait, then open a window.
+sleep "${BENCH_APP_DELAY:-1}"
+exec foot --app-id=benchapp --title="bench app" -e sleep 600

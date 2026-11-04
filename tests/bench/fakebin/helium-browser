@@ -1,0 +1,14 @@
+#!/bin/sh
+# Model a browser starting: wait, then map windows that match the saved titles.
+sleep "${HELIUM_FAKE_DELAY:-2}"
+echo $$ > "${HELIUM_FAKE_PIDFILE:-/tmp/helium.pid}"
+
+old_ifs=$IFS
+IFS=,
+for title in ${HELIUM_FAKE_TITLES:-h0,h1,h2}; do
+	foot --app-id=helium --title="$title" -e sleep 600 &
+	sleep 0.05
+done
+IFS=$old_ifs
+
+sleep "${HELIUM_FAKE_LINGER:-5}"
