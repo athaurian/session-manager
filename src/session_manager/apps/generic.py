@@ -22,6 +22,7 @@ from ..ipc import (
     get_tree,
     matches_app,
     matching_window_ids,
+    node_app_id,
     node_pid,
     walk_tree,
 )
@@ -74,7 +75,11 @@ def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
     Return None for apps that have a dedicated launcher.
     """
     canonical = canonical_app_id(app_id)
-    if canonical in ("kitty", "kitty_drop"):
+    # The handler table is the single list of apps that have their own
+    # launcher; only the fallback handler starts from a command.
+    from .handlers import handler_for
+
+    if handler_for(canonical).launch is not launch_generic:
         return None
     cmd = APP_ID_COMMANDS.get(canonical)
     if cmd:
@@ -263,7 +268,9 @@ def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch or locate the window for a saved node."""
     from .handlers import handler_for
 
-    handler = handler_for(canonical_app_id(node.get("app_id", "")))
+    # A saved window always carries an app_id, but a hand-written or older
+    # payload may only have its WM_CLASS; node_app_id falls back to it.
+    handler = handler_for(node_app_id(node))
     if handler.launch is None:
         return None
     return handler.launch(node, claimed_ids)
@@ -271,7 +278,7 @@ def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
 
 def launch_generic(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch an app from its command or desktop entry, and return its window."""
-    app_id = canonical_app_id(node.get("app_id", ""))
+    app_id = node_app_id(node)
     class_name = node.get("class", "")
 
     cmd_args = get_cmd_from_app_id(app_id, class_name)

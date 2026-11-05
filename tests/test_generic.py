@@ -17,14 +17,22 @@ from tests.helpers import FakeWatcher, RecordingPopen
 
 class TestGetCmdFromAppId(unittest.TestCase):
     def test_known_app_id_command(self):
-        self.assertEqual(gen_mod.get_cmd_from_app_id("thunar", ""), ["thunar"])
+        self.assertEqual(gen_mod.get_cmd_from_app_id("vesktop", ""), ["vesktop"])
         self.assertEqual(
-            gen_mod.get_cmd_from_app_id("org.pwmt.zathura", ""), ["zathura"]
+            gen_mod.get_cmd_from_app_id("org.keepassxc.KeePassXC", ""),
+            ["gtk-launch", "org.keepassxc.KeePassXC"],
         )
 
-    def test_kitty_returns_none(self):
-        self.assertIsNone(gen_mod.get_cmd_from_app_id("kitty", ""))
-        self.assertIsNone(gen_mod.get_cmd_from_app_id("kitty_drop", ""))
+    def test_dedicated_launchers_return_none(self):
+        for app_id in (
+            "kitty",
+            "kitty_drop",
+            "thunar",
+            "org.pwmt.zathura",
+            "mpv",
+            "helium",
+        ):
+            self.assertIsNone(gen_mod.get_cmd_from_app_id(app_id, ""))
 
     def test_unknown_returns_empty(self):
         # Unknown app without desktop file returns empty sentinel (not None).
