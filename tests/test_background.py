@@ -78,6 +78,9 @@ class TestRestoreBackgroundApps(unittest.TestCase):
             unittest.mock.patch.object(bg_mod, "_ensure_background_daemons"),
             unittest.mock.patch.object(bg_mod, "matching_window_ids", return_value=[]),
             unittest.mock.patch.object(bg_mod.subprocess, "Popen", fake_popen),
+            # The launcher notifies when it starts Vesktop; a test must not
+            # send a real desktop notification.
+            unittest.mock.patch("session_manager.logging_setup.notify"),
         ]
         for p in self.patches:
             p.start()
@@ -241,14 +244,6 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
             unittest.mock.patch.dict(
                 os.environ, {"SWAY_SESSION_SKIP_DAEMON_CHECKS": "1"}
             ),
-            unittest.mock.patch.object(bg_mod.subprocess, "run") as run,
-        ):
-            bg_mod._ensure_background_daemons()
-        run.assert_not_called()
-
-    def test_skips_checks_when_launches_are_mocked(self):
-        with (
-            unittest.mock.patch.object(bg_mod.subprocess, "Popen", object()),
             unittest.mock.patch.object(bg_mod.subprocess, "run") as run,
         ):
             bg_mod._ensure_background_daemons()

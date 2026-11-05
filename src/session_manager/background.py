@@ -14,8 +14,6 @@ from .proc_cache import ProcCache
 
 log = logging.getLogger("session_manager")
 
-_ORIGINAL_POPEN = subprocess.Popen
-
 # The installed Vesktop launcher is a wrapper script that execs
 # `electron44`, so the running process is not named "vesktop" and its
 # executable is shared with other Electron apps. Only its command line
@@ -84,9 +82,6 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
 
     # Skip health checks in tests via explicit opt-out.
     if os.getenv("SWAY_SESSION_SKIP_DAEMON_CHECKS") == "1":
-        return
-    # Skip health checks when subprocess is mocked in tests.
-    if subprocess.Popen is not _ORIGINAL_POPEN:
         return
 
     backend = detect_backend()
@@ -231,7 +226,7 @@ def restore_background_apps(
             log.warning("Could not start vesktop: %s", exc)
             continue
         log.info("Restored vesktop --start-minimized")
-        if notify_user and subprocess.Popen is _ORIGINAL_POPEN:
+        if notify_user:
             from .logging_setup import notify
 
             notify("vesktop restored", urgency="low", timeout_ms=3000)
