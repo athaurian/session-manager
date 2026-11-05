@@ -38,18 +38,31 @@ def _read_environ(pid: int) -> dict[str, str]:
 
 
 def _find_pids(name: str) -> list[int]:
-    """Return the PIDs of the running processes named `name`."""
+    """Return the PIDs of the running processes named `name`.
+
+    Only processes owned by the current user are considered: another
+    user's compositor would otherwise supply a display and an IPC socket
+    that belong to a different session.
+    """
     pids: list[int] = []
     try:
         entries = os.listdir(PROC_ROOT)
     except OSError:
         return pids
+    uid = os.getuid()
     for entry in entries:
         if not entry.isdigit():
             continue
+        proc_dir = PROC_ROOT / entry
         try:
-            comm = (PROC_ROOT / entry / "comm").read_text().strip()
+            if os.stat(proc_dir).st_uid != uid:
+                continue
         except OSError:
+            continue
+        try:
+            comm = (proc_dir / "comm").read_bytes().decode("utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            # A process whose name is not valid UTF-8 is not ours.
             continue
         if comm == name:
             pids.append(int(entry))
@@ -164,7 +177,7 @@ def compositor_env() -> dict[str, str]:
                 env["WAYLAND_DISPLAY"] = name
                 runtime_dir = os.path.dirname(path)
                 if runtime_dir:
-                    env.setdefault("XDG_RUNTIME_DIR", runtime_dir)
+                    _fill_in(env, "XDG_RUNTIME_DIR", runtime_dir)
                 break
     elif not env.get("XDG_RUNTIME_DIR"):
         fallback_dir = compositor.get("XDG_RUNTIME_DIR")

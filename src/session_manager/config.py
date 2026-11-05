@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from pathlib import Path
@@ -93,11 +94,19 @@ def escape_cwd(cwd: str) -> str:
 
 
 def _float_env(name: str, default: float) -> float:
-    """Read a float environment variable, falling back on invalid input."""
+    """Read a float environment variable, falling back on invalid input.
+
+    Only a finite, non-negative number is accepted. A timeout of ``nan``
+    or ``inf`` would break every deadline that uses it, and a negative
+    one would make the deadline fire immediately.
+    """
     try:
-        return float(os.environ.get(name, str(default)))
+        value = float(os.environ.get(name, str(default)))
     except ValueError:
         return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
 
 
 IPC_REQUEST_TIMEOUT = _float_env("SWAY_SESSION_IPC_REQUEST_TIMEOUT", 1.0)

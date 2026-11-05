@@ -38,5 +38,28 @@ class TestXdgDir(unittest.TestCase):
             )
 
 
+class TestFloatEnv(unittest.TestCase):
+    def test_reads_a_valid_value(self):
+        with unittest.mock.patch.dict(os.environ, {"SM_TEST_TIMEOUT": "2.5"}):
+            self.assertEqual(cfg_mod._float_env("SM_TEST_TIMEOUT", 1.0), 2.5)
+
+    def test_falls_back_on_invalid_input(self):
+        with unittest.mock.patch.dict(os.environ, {"SM_TEST_TIMEOUT": "soon"}):
+            self.assertEqual(cfg_mod._float_env("SM_TEST_TIMEOUT", 1.0), 1.0)
+
+    def test_rejects_a_value_that_is_not_finite(self):
+        for value in ("nan", "inf", "-inf"):
+            with (
+                self.subTest(value=value),
+                unittest.mock.patch.dict(os.environ, {"SM_TEST_TIMEOUT": value}),
+            ):
+                self.assertEqual(cfg_mod._float_env("SM_TEST_TIMEOUT", 1.0), 1.0)
+
+    def test_rejects_a_negative_value(self):
+        """A negative deadline would fire immediately."""
+        with unittest.mock.patch.dict(os.environ, {"SM_TEST_TIMEOUT": "-1"}):
+            self.assertEqual(cfg_mod._float_env("SM_TEST_TIMEOUT", 1.0), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
