@@ -104,10 +104,10 @@ through `uv`, so no project virtual environment is required.
   suite.
 - The main state file is authoritative for background apps. The sidecar
   `*_session_background_apps.json` is compatibility output.
-- Save flushes Helium's session files with a short sleep, and floating
-  geometry is retried after a settle delay. Both are known debt.
-- The dropdown terminal and transient helper terminals are intentionally not
-  saved.
+- Save records Helium's session files as they are; a window opened immediately
+  before a save can be missing from `--restore-last-session`.
+- The dropdown terminal is saved but does not count as restorable content;
+  transient helper terminals are not saved.
 - Helium restores through `--restore-last-session` and matches windows by
   title. A running instance is reused when it already has enough windows.
 
