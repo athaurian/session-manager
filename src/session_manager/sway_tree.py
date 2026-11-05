@@ -134,7 +134,12 @@ def clean_tree(node: dict, cache: ProcCache) -> dict | None:
             handler = handler_for(app_id)
 
         pid = node_pid(source)
-        info = handler.capture(source, pid, cache) if handler.capture else {}
+        try:
+            info = handler.capture(source, pid, cache) if handler.capture else {}
+        except Exception:
+            # One app's capture failure must not discard the whole session.
+            log.exception("Failed to capture %s; saving the window without it", app_id)
+            info = {}
 
         percent = source.get("percent")
         window: dict[str, object] = {

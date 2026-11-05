@@ -144,6 +144,21 @@ class TestCleanTreeWindows(CleanTreeTestCase):
         self.assertEqual(result["document_path"], "/books/my.epub")
         self.assertEqual(result["calibre_format"], "EPUB")
 
+    def test_capture_failure_keeps_the_window(self):
+        from session_manager.apps.handlers import AppHandler
+
+        def fail(_source, _pid, _cache):
+            raise OSError("nvim disappeared")
+
+        handler = AppHandler(capture=fail)
+        with unittest.mock.patch.object(st_mod, "handler_for", return_value=handler):
+            result = st_mod.clean_tree(
+                tree_window("vesktop", name="Discord"), FakeCache()
+            )
+        self.assertEqual(result["type"], "window")
+        self.assertEqual(result["app_id"], "vesktop")
+        self.assertNotIn("cwd", result)
+
     def test_generic_window_passthrough(self):
         node = tree_window("vesktop", name="Discord", fullscreen_mode=1, marks=["m1"])
         result = st_mod.clean_tree(node, FakeCache())

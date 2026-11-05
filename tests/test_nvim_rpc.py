@@ -66,6 +66,12 @@ class TestNvimRpc(unittest.TestCase):
         ):
             self.assertIsNone(rpc_mod.nvim_rpc("/tmp/nvim.sock", "x", "pid"))
 
+    def test_missing_nvim_returns_none(self):
+        with unittest.mock.patch.object(
+            rpc_mod.subprocess, "run", side_effect=FileNotFoundError("nvim")
+        ):
+            self.assertIsNone(rpc_mod.nvim_rpc("/tmp/nvim.sock", "x", "pid"))
+
 
 if __name__ == "__main__":
     unittest.main()

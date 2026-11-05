@@ -54,6 +54,6 @@ def nvim_rpc(
             timeout=timeout,
             env=env,
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     return extract_json(result.stdout + "\n" + result.stderr, marker)
