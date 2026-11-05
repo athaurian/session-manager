@@ -16,6 +16,23 @@ log = logging.getLogger("session_manager")
 
 _ORIGINAL_POPEN = subprocess.Popen
 
+# The installed Vesktop launcher is a wrapper script that execs
+# `electron44`, so the running process is not named "vesktop" and its
+# executable is shared with other Electron apps. Only its command line
+# still names the app's own directory.
+_VESKTOP_CMDLINE_MARKER = "/vesktop"
+
+
+def _vesktop_running(cache: ProcCache) -> bool:
+    """Report whether Vesktop is running.
+
+    The launcher execs a generic Electron binary, so the process name
+    does not identify the app; the command line still does.
+    """
+    return cache.process_named_running("vesktop") or cache.cmdline_contains(
+        _VESKTOP_CMDLINE_MARKER
+    )
+
 
 def detect_background_apps(
     cache: ProcCache | None = None,
@@ -30,7 +47,7 @@ def detect_background_apps(
         if tree is not None
         else matching_window_ids("vesktop", "")
     )
-    if cache.process_named_running("vesktop") and not vesktop_visible:
+    if _vesktop_running(cache) and not vesktop_visible:
         apps.append({"app_id": "vesktop"})
     return apps
 
@@ -172,7 +189,7 @@ def restore_background_apps(
             continue
         if cache is None:
             cache = ProcCache.snapshot()
-        if cache.process_named_running("vesktop"):
+        if _vesktop_running(cache):
             continue
         try:
             subprocess.Popen(

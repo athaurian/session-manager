@@ -11,12 +11,16 @@ import session_manager.background as bg_mod
 
 
 class FakeCache:
-    def __init__(self, running: bool = False):
+    def __init__(self, running: bool = False, cmdline: str = ""):
         self.running = running
+        self.cmdline = cmdline
         self.snapshot_calls = 0
 
     def process_named_running(self, name):
         return self.running
+
+    def cmdline_contains(self, text):
+        return text.lower() in self.cmdline.lower()
 
 
 class TestDetectBackgroundApps(unittest.TestCase):
@@ -39,6 +43,26 @@ class TestDetectBackgroundApps(unittest.TestCase):
             bg_mod, "matching_window_ids_in_tree", return_value=[]
         ):
             result = bg_mod.detect_background_apps(FakeCache(running=False), tree={})
+        self.assertEqual(result, [])
+
+    def test_exec_launcher_detected(self):
+        """The installed launcher execs `electron44`, not `vesktop`."""
+        cache = FakeCache(
+            running=False, cmdline="/usr/bin/electron44 /usr/lib/vesktop/app.asar"
+        )
+        with unittest.mock.patch.object(
+            bg_mod, "matching_window_ids_in_tree", return_value=[]
+        ):
+            result = bg_mod.detect_background_apps(cache, tree={})
+        self.assertEqual(result, [{"app_id": "vesktop"}])
+
+    def test_unrelated_command_line_not_detected(self):
+        """A bare mention of the name is not the app's own path."""
+        cache = FakeCache(running=False, cmdline="/usr/bin/grep vesktop")
+        with unittest.mock.patch.object(
+            bg_mod, "matching_window_ids_in_tree", return_value=[]
+        ):
+            result = bg_mod.detect_background_apps(cache, tree={})
         self.assertEqual(result, [])
 
 
@@ -73,6 +97,14 @@ class TestRestoreBackgroundApps(unittest.TestCase):
         bg_mod.restore_background_apps(
             [{"app_id": "vesktop"}], cache=FakeCache(running=True)
         )
+        self.assertEqual(self.popen_calls, [])
+
+    def test_skips_when_the_launcher_process_is_running(self):
+        """The launcher execs `electron44`, so only the command line says so."""
+        cache = FakeCache(
+            running=False, cmdline="/usr/bin/electron44 /usr/lib/vesktop/app.asar"
+        )
+        bg_mod.restore_background_apps([{"app_id": "vesktop"}], cache=cache)
         self.assertEqual(self.popen_calls, [])
 
     def test_skips_non_vesktop(self):

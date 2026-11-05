@@ -1,4 +1,4 @@
-"""Single-pass /proc indexer. Indexing costs O(N) once; lookups are O(1)."""
+"""Single-pass /proc indexer. Indexing costs O(N) once; name lookups are O(1)."""
 
 from __future__ import annotations
 
@@ -120,6 +120,20 @@ class ProcCache:
     def process_named_running(self, name: str) -> bool:
         """Report whether a process with the given name is running."""
         return bool(self.by_comm(name) or self.by_cmdline_name(name))
+
+    def cmdline_contains(self, text: str) -> bool:
+        """Report whether any process mentions the given text in its command line.
+
+        A launcher script may exec a generic binary, so the process name
+        alone no longer identifies the app. Vesktop's wrapper execs
+        ``electron44`` and keeps the app's path only in the arguments.
+        """
+        needle = text.lower()
+        return any(
+            needle in arg.lower()
+            for entry in self._entries.values()
+            for arg in entry.cmdline
+        )
 
     def get_nvim_pid(self, pid: int) -> int | None:
         """Return a Neovim descendant of a pid, searching depth-first."""

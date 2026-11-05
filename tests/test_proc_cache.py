@@ -67,6 +67,24 @@ class TestProcCache(unittest.TestCase):
         self.assertEqual(cache.by_cmdline_name("prog"), {11})
         self.assertTrue(cache.process_named_running("prog"))
 
+    def test_cmdline_contains(self):
+        cache = ProcCache()
+        self._inject(
+            cache,
+            21,
+            0,
+            "electron44",
+            cmdline=["/usr/bin/electron44", "/usr/lib/vesktop/app.asar"],
+        )
+        self.assertTrue(cache.cmdline_contains("/vesktop"))
+        self.assertTrue(cache.cmdline_contains("Vesktop"))
+        self.assertFalse(cache.cmdline_contains("helium"))
+
+    def test_cmdline_contains_ignores_processes_without_arguments(self):
+        cache = ProcCache()
+        self._inject(cache, 22, 0, "vesktop")
+        self.assertFalse(cache.cmdline_contains("/vesktop"))
+
     def test_get_missing(self):
         self.assertIsNone(ProcCache().get(999999))
 
