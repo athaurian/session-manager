@@ -44,32 +44,178 @@ export SWAYSOCK
 export WAYLAND_DISPLAY=wayland-1
 echo "sway: $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])')"
 
+# Wait on the compositor tree rather than on a fixed delay. The tree is the
+# source of truth for whether a window has mapped, moved, or gone away.
+wait_for_title() {
+    local title=$1
+    for _ in $(seq 1 100); do
+        if swaymsg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "window '$title' did not appear" >&2
+    return 1
+}
+
+wait_for_title_gone() {
+    local title=$1
+    for _ in $(seq 1 100); do
+        if ! swaymsg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "window '$title' did not disappear" >&2
+    return 1
+}
+
+wait_for_app_gone() {
+    local app=$1
+    for _ in $(seq 1 100); do
+        if ! swaymsg -t get_tree 2>/dev/null | grep -Fq "\"app_id\": \"$app\""; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "app '$app' did not disappear" >&2
+    return 1
+}
+
+wait_for_floating() {
+    local title=$1
+    for _ in $(seq 1 100); do
+        if swaymsg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+title = sys.argv[1]
+
+def walk(node):
+    if node.get("type") == "floating_con" and node.get("name") == title:
+        return True
+    return any(
+        walk(child)
+        for child in node.get("nodes", []) + node.get("floating_nodes", [])
+    )
+
+sys.exit(0 if walk(json.load(sys.stdin)) else 1)
+' "$title"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "window '$title' did not float" >&2
+    return 1
+}
+
+wait_for_rect_stable() {
+    local title=$1
+    local previous=""
+    local current
+    for _ in $(seq 1 100); do
+        current=$(swaymsg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+title = sys.argv[1]
+
+def find(node):
+    if node.get("name") == title:
+        return node.get("rect", {})
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        found = find(child)
+        if found is not None:
+            return found
+    return None
+
+rect = find(json.load(sys.stdin))
+print(json.dumps(rect, sort_keys=True) if rect is not None else "")
+' "$title" 2>/dev/null || true)
+        if [ -n "$current" ] && [ "$current" = "$previous" ]; then
+            return 0
+        fi
+        previous=$current
+        sleep 0.1
+    done
+    echo "window '$title' geometry did not settle" >&2
+    return 1
+}
+
+wait_for_scratchpad() {
+    local title=$1
+    for _ in $(seq 1 100); do
+        if swaymsg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+title = sys.argv[1]
+
+def find_scratchpad(node):
+    if node.get("name") == "__i3_scratch":
+        return node
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        found = find_scratchpad(child)
+        if found:
+            return found
+    return None
+
+def has_title(node):
+    if node.get("name") == title:
+        return True
+    return any(
+        has_title(child)
+        for child in node.get("nodes", []) + node.get("floating_nodes", [])
+    )
+
+scratchpad = find_scratchpad(json.load(sys.stdin))
+sys.exit(0 if scratchpad and has_title(scratchpad) else 1)
+' "$title"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "window '$title' did not move to the scratchpad" >&2
+    return 1
+}
+
+verify_restored() {
+    local saved=$1
+    local log=/tmp/verify.log
+    for _ in $(seq 1 100); do
+        swaymsg -t get_tree >/tmp/tree.json
+        if python3 /src/tests/integration/verify.py \
+            --saved "$saved" --tree /tmp/tree.json >"$log" 2>&1; then
+            cat "$log"
+            return 0
+        fi
+        sleep 0.2
+    done
+    cat "$log" >&2
+    return 1
+}
+
 # Workspace 1 gets three tiled terminals in a nested split. Workspace 2 gets
 # a floating one. The nested shape is what the arrangement walk has to
 # reproduce after the windows are materialized concurrently.
 swaymsg 'workspace 1' >/dev/null
 foot -T alpha -e sleep 600 >/tmp/foot-alpha.log 2>&1 &
-sleep 2
+wait_for_title alpha
 foot -T beta -e sleep 600 >/tmp/foot-beta.log 2>&1 &
-sleep 2
+wait_for_title beta
 swaymsg '[title="^beta$"] focus' >/dev/null
 swaymsg 'split v' >/dev/null
 foot -T gamma -e sleep 600 >/tmp/foot-gamma.log 2>&1 &
-sleep 2
+wait_for_title gamma
 swaymsg 'workspace 2' >/dev/null
 foot -T delta -e sleep 600 >/tmp/foot-delta.log 2>&1 &
-sleep 2
+wait_for_title delta
 swaymsg '[title="^delta$"] floating enable' >/dev/null
+wait_for_floating delta
 swaymsg '[title="^delta$"] resize set 600 400' >/dev/null
 swaymsg '[title="^delta$"] move position 100 100' >/dev/null
-sleep 1
+wait_for_rect_stable delta
 
 # A hidden scratchpad window must still be parked out of sight after restore.
 swaymsg 'workspace 1' >/dev/null
 foot -T epsilon -e sleep 600 >/tmp/foot-epsilon.log 2>&1 &
-sleep 2
+wait_for_title epsilon
 swaymsg '[title="^epsilon$"] move scratchpad' >/dev/null
-sleep 1
+wait_for_scratchpad epsilon
 
 python3 -m session_manager save --quiet
 echo "saved sway state"
@@ -100,24 +246,18 @@ print('saved windows:', windows)
 PY
 
 pkill -x foot 2>/dev/null || true
-sleep 2
+wait_for_app_gone foot
 python3 -m session_manager restore --quiet
-sleep 5
-swaymsg -t get_tree >/tmp/tree.json
-python3 /src/tests/integration/verify.py \
-    --saved "$XDG_STATE_HOME/sway_session.json" --tree /tmp/tree.json
+verify_restored "$XDG_STATE_HOME/sway_session.json"
 
 echo '--- restore with no WAYLAND_DISPLAY/SWAYSOCK ---'
 pkill -x foot 2>/dev/null || true
-sleep 2
+wait_for_app_gone foot
 unset WAYLAND_DISPLAY SWAYSOCK I3SOCK DISPLAY
 python3 -m session_manager restore --quiet
-sleep 5
 SWAYSOCK=$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'sway-ipc.*.sock' | head -1)
 export SWAYSOCK
 export WAYLAND_DISPLAY=wayland-1
-swaymsg -t get_tree >/tmp/tree.json
-python3 /src/tests/integration/verify.py \
-    --saved "$XDG_STATE_HOME/sway_session.json" --tree /tmp/tree.json
+verify_restored "$XDG_STATE_HOME/sway_session.json"
 
 echo 'PASS: sway roundtrip'
