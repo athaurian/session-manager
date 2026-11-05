@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..config import APP_PROFILES, CALIBRE_CONFIG, CALIBRE_DB
 from ..ipc import WindowEventWatcher, matching_window_ids
+from ..proc_cache import ProcCache
 from ._common import reap_if_needed
 
 log = logging.getLogger("session_manager")
@@ -113,6 +114,18 @@ def get_ebook_viewer_document(title: str, fmt: str) -> str | None:
     if doc_path is not None:
         return doc_path
     return _resolve_calibre_document_from_library(title, fmt)
+
+
+def capture_calibre(source: dict, _pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved document for an ebook viewer window."""
+    parsed = calibre_title_from_window(source.get("name", ""))
+    if parsed is None:
+        return {"document_path": "", "calibre_format": ""}
+    title, fmt = parsed
+    return {
+        "document_path": get_ebook_viewer_document(title, fmt) or "",
+        "calibre_format": fmt,
+    }
 
 
 def launch_ebook_viewer(node: dict, claimed_ids: MutableSet[int]) -> int | None:

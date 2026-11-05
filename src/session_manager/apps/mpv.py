@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..config import APP_WAIT_TIMEOUT
 from ..ipc import WindowEventWatcher
+from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
 
 
@@ -17,6 +18,11 @@ def get_mpv_info(pid: int) -> str:
         if arg and not arg.startswith("-") and Path(arg).is_file():
             return arg
     return ""
+
+
+def capture_mpv(_source: dict, pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved media file for an mpv window."""
+    return {"media_path": get_mpv_info(pid)}
 
 
 def launch_mpv(node: dict, claimed_ids: MutableSet[int]) -> int | None:

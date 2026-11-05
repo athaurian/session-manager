@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..config import APP_WAIT_TIMEOUT
 from ..ipc import WindowEventWatcher
+from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
 
 
@@ -24,6 +25,11 @@ def get_thunar_info(pid: int) -> str:
     except OSError:
         pass
     return ""
+
+
+def capture_thunar(_source: dict, pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved folder for a Thunar window."""
+    return {"folder_path": get_thunar_info(pid)}
 
 
 def launch_thunar(node: dict, claimed_ids: MutableSet[int]) -> int | None:

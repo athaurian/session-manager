@@ -13,6 +13,7 @@ from ..config import (
     ZATHURA_GOTO_PAGE_DEADLINE,
 )
 from ..ipc import WindowEventWatcher
+from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
 
 
@@ -68,6 +69,12 @@ def get_zathura_info(pid: int) -> tuple[str, int]:
         if arg and not arg.startswith("-") and Path(arg).is_file():
             return arg, 0
     return "", 0
+
+
+def capture_zathura(_source: dict, pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved document and page for a zathura window."""
+    doc, page = get_zathura_info(pid)
+    return {"document_path": doc, "page_number": page}
 
 
 def launch_zathura(node: dict, claimed_ids: MutableSet[int]) -> int | None:

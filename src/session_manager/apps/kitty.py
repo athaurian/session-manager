@@ -12,12 +12,117 @@ from pathlib import Path
 from ..config import (
     DROP_TERMINAL_INSTANCE,
     DROP_TERMINAL_TITLE,
+    NVIM_SESSION_DIR,
     TERMINAL_WAIT_TIMEOUT,
+    TRANSIENT_TERMINAL_TITLES,
+    escape_cwd,
 )
-from ..ipc import WindowEventWatcher
+from ..ipc import WindowEventWatcher, node_instance
+from ..nvim.inspect import get_terminal_nvim_state, is_dashboard_state
+from ..nvim.snapshot import (
+    create_manager_snapshot,
+    get_nvim_snapshot_path,
+    snacks_sidecar_path,
+)
+from ..nvim.sockets import nvim_socket_path
+from ..proc_cache import ProcCache
 from ._common import reap_if_needed
 
 log = logging.getLogger("session_manager")
+
+# The drop terminal is identified by any of its WM_CLASS instance, window name,
+# or mark, because each window manager surfaces a different subset of them.
+_TRANSIENT_KITTY_TITLES = frozenset(TRANSIENT_TERMINAL_TITLES)
+_TRANSIENT_KITTY_INSTANCES = frozenset(TRANSIENT_TERMINAL_TITLES)
+_DROP_KITTY_MARK = "drop_term"
+_DROP_KITTY_TITLE = DROP_TERMINAL_TITLE
+_DROP_KITTY_INSTANCE = DROP_TERMINAL_INSTANCE
+
+
+def _legacy_session_file(cwd: str) -> str:
+    """Return a legacy per-directory session file path, or an empty string."""
+    sf = NVIM_SESSION_DIR / f"{escape_cwd(cwd)}.vim"
+    return str(sf) if sf.exists() else ""
+
+
+def classify_kitty(node: dict, app_id: str) -> str | None:
+    """Classify a live kitty window, dropping transient helper terminals."""
+    if app_id != "kitty":
+        return app_id
+
+    title = node.get("name") or ""
+    instance = node_instance(node)
+    marks = node.get("marks") or []
+
+    if (
+        title in _TRANSIENT_KITTY_TITLES
+        or instance in _TRANSIENT_KITTY_INSTANCES
+        or any(mark in _TRANSIENT_KITTY_INSTANCES for mark in marks)
+    ):
+        return None
+
+    if (
+        title == _DROP_KITTY_TITLE
+        or instance == _DROP_KITTY_INSTANCE
+        or _DROP_KITTY_MARK in marks
+    ):
+        return "kitty_drop"
+    return app_id
+
+
+def capture_kitty(_source: dict, pid: int, cache: ProcCache) -> dict[str, object]:
+    """Return the saved terminal state for a kitty window."""
+    cwd = cache.get_terminal_cwd(pid) if pid else str(Path.home())
+    zellij_sess = cache.get_zellij_session(pid) if pid else None
+    is_ssh, ssh_cmd = cache.is_ssh_or_sudo(pid) if pid else (False, "")
+    nvim_pid = cache.get_nvim_pid(pid) if pid else None
+
+    info: dict[str, object] = {}
+    if zellij_sess is not None:
+        info["nvim_type"] = "none"
+        info["zellij_session"] = zellij_sess
+        info["cwd"] = cwd
+        log.info("Kitty %s has zellij session %s", pid, zellij_sess)
+    elif is_ssh:
+        info["nvim_type"] = "none"
+        info["was_ssh"] = ssh_cmd
+        info["cwd"] = cwd
+        log.info("Kitty %s is ssh/sudo (%s), saving cwd only", pid, ssh_cmd)
+    elif nvim_pid is not None:
+        nvim_server_pid, live_state = get_terminal_nvim_state(pid, cache)
+
+        if live_state is None:
+            info["nvim_type"] = "unknown"
+            info["session_file"] = _legacy_session_file(cwd)
+        elif is_dashboard_state(live_state):
+            info["nvim_type"] = "dashboard"
+        else:
+            snapshot_path = get_nvim_snapshot_path(cwd, nvim_server_pid)
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            server_path = (
+                str(nvim_socket_path(nvim_server_pid))
+                if nvim_server_pid is not None
+                else ""
+            )
+            ok, err = create_manager_snapshot(
+                server_path, snapshot_path, nvim_server_pid
+            )
+            if ok and snapshot_path.exists():
+                info["nvim_type"] = "session"
+                info["nvim_snapshot"] = str(snapshot_path)
+                sidecar = snacks_sidecar_path(snapshot_path)
+                if sidecar.exists():
+                    info["nvim_snacks_sidecar"] = str(sidecar)
+            else:
+                info["nvim_type"] = "unknown"
+                info["session_file"] = _legacy_session_file(cwd)
+                log.warning("Failed to snapshot nvim in %s (using file): %s", cwd, err)
+        info["cwd"] = cwd
+    else:
+        info["nvim_type"] = "none"
+        info["cwd"] = cwd
+
+    return info
 
 
 def _zellij_args(node: dict) -> list[str] | None:

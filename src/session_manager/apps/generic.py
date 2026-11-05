@@ -33,6 +33,7 @@ __all__ = [
     "find_unclaimed_window",
     "get_cmd_from_app_id",
     "launch_and_get_id",
+    "launch_generic",
     "matching_window_ids",
     "wait_for_app_window",
     "wait_for_window_by_pid",
@@ -238,29 +239,18 @@ def wait_for_window_by_pid(
 
 def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch or locate the window for a saved node."""
-    from .calibre import launch_ebook_viewer
-    from .kitty import launch_kitty, launch_kitty_drop
-    from .mpv import launch_mpv
-    from .thunar import launch_thunar
-    from .zathura import launch_zathura
+    from .handlers import handler_for
 
+    handler = handler_for(canonical_app_id(node.get("app_id", "")))
+    if handler.launch is None:
+        return None
+    return handler.launch(node, claimed_ids)
+
+
+def launch_generic(node: dict, claimed_ids: MutableSet[int]) -> int | None:
+    """Launch an app from its command or desktop entry, and return its window."""
     app_id = canonical_app_id(node.get("app_id", ""))
     class_name = node.get("class", "")
-
-    if app_id == "helium":
-        return None
-    if app_id == "kitty":
-        return launch_kitty(node, claimed_ids)
-    if app_id == "kitty_drop":
-        return launch_kitty_drop(node, claimed_ids)
-    if app_id == "org.pwmt.zathura":
-        return launch_zathura(node, claimed_ids)
-    if app_id == "calibre-ebook-viewer":
-        return launch_ebook_viewer(node, claimed_ids)
-    if app_id == "thunar":
-        return launch_thunar(node, claimed_ids)
-    if app_id == "mpv":
-        return launch_mpv(node, claimed_ids)
 
     cmd_args = get_cmd_from_app_id(app_id, class_name)
     if not cmd_args:

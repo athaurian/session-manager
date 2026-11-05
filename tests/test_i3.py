@@ -5,6 +5,7 @@ import unittest
 import unittest.mock
 
 import session_manager.apps.generic as gen_mod
+import session_manager.apps.thunar as thunar_mod
 import session_manager.background as bg_mod
 import session_manager.config as cfg_mod
 import session_manager.ipc as ipc_mod
@@ -252,7 +253,7 @@ class TestCleanTreeI3(unittest.TestCase):
     def test_x11_window_uses_class_as_app_id(self):
         node = i3_window("Thunar", border="normal")
         with unittest.mock.patch.object(
-            st_mod, "get_thunar_info", return_value="/home/user"
+            thunar_mod, "get_thunar_info", return_value="/home/user"
         ):
             result = st_mod.clean_tree(node, FakeCache())
         self.assertIsNotNone(result)

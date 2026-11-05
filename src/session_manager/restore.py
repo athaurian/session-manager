@@ -13,6 +13,7 @@ from functools import partial
 from typing import Any
 
 from .apps.generic import launch_and_get_id
+from .apps.handlers import handler_for
 from .apps.helium import (
     collect_helium_nodes,
     get_helium_restored_id,
@@ -181,10 +182,14 @@ def _adopt_live_windows(nodes: list[dict], ctx: RestoreContext) -> None:
     live window is claimed at most once, so two saved windows never resolve
     to the same one.
 
-    Helium nodes are left to the browser group restore, which already
-    matches its windows by title.
+    A grouped app is left to its own group restore, which already matches
+    its windows by title.
     """
-    candidates = [node for node in nodes if node_app_id(node) != "helium"]
+    candidates = [
+        node
+        for node in nodes
+        if handler_for(canonical_app_id(node_app_id(node))).adoptable
+    ]
     if not candidates:
         return
     try:
@@ -217,27 +222,23 @@ def _adopt_live_windows(nodes: list[dict], ctx: RestoreContext) -> None:
         log.info("Reused %d live window(s) instead of launching them", reused)
 
 
-# Launchers that wait for the window owned by the process they started. Those
-# are safe to run concurrently even for the same application.
-_PID_MATCHED = frozenset({"kitty", "kitty_drop", "thunar", "mpv", "org.pwmt.zathura"})
-
-
 def _launch_units(nodes: list[dict]) -> list[list[dict]]:
     """Group saved nodes into independent launch units.
 
     A unit launches once. Windows matched by pid are independent, so each
     gets its own unit and they all start together. Windows matched by app
     identity share one unit per app: two concurrent launches of the same app
-    could otherwise claim each other's window.
+    could otherwise claim each other's window. A grouped app is restored by
+    its own group pass instead.
     """
     units: dict[tuple[str, ...], list[dict]] = {}
     for node in nodes:
         app_id = canonical_app_id(node_app_id(node))
-        if app_id == "helium":
-            # The browser restores all its windows as one group.
+        handler = handler_for(app_id)
+        if handler.grouped:
             continue
         key: tuple[str, ...]
-        if app_id in _PID_MATCHED:
+        if handler.pid_matched:
             key = ("node", str(id(node)))
         else:
             key = ("app", app_id, str(node.get("class", "")))
@@ -837,19 +838,20 @@ def _resolve_window(node: dict, ctx: RestoreContext) -> int | None:
 
     The normal path reads the id that materialization already resolved. A
     node that bypassed materialization, such as a hidden scratchpad window
-    launched just before it is parked, falls back to launching on demand.
+    launched just before it is parked, falls back to launching on demand. A
+    grouped app asks its group restore for the id instead.
     """
     if ctx.registry.has(node):
         return ctx.registry.resolve(node)
-    if node_app_id(node) == "helium":
+    if handler_for(canonical_app_id(node_app_id(node))).grouped:
         return get_helium_restored_id(node, ctx)
     return launch_and_get_id(node, ctx.claimed_ids)
 
 
 def _record_missing(ctx: RestoreContext, node: dict) -> None:
     """Record a saved window that did not come back."""
-    if node_app_id(node) == "kitty_drop":
-        # The dropdown terminal is spawned by its own keybinding on demand.
+    if handler_for(canonical_app_id(node_app_id(node))).on_demand:
+        # A window spawned by its own keybinding is not lost.
         return
     ctx.add_missing(_failure_label(node))
 

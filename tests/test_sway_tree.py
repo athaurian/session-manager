@@ -5,6 +5,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+import session_manager.apps.calibre as calibre_mod
+import session_manager.apps.kitty as kitty_mod
+import session_manager.apps.zathura as zathura_mod
 import session_manager.sway_tree as st_mod
 from tests.helpers import make_window
 
@@ -43,12 +46,12 @@ class CleanTreeTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.patches = [
             unittest.mock.patch.object(
-                st_mod,
+                kitty_mod,
                 "get_nvim_snapshot_path",
                 lambda cwd, pid: Path(self.tmp.name) / f"snap_{pid}.vim",
             ),
             unittest.mock.patch.object(
-                st_mod,
+                kitty_mod,
                 "snacks_sidecar_path",
                 lambda p: Path(str(p) + ".snacks"),
             ),
@@ -81,7 +84,7 @@ class TestCleanTreeWindows(CleanTreeTestCase):
 
     def test_kitty_dashboard_nvim(self):
         with unittest.mock.patch.object(
-            st_mod,
+            kitty_mod,
             "get_terminal_nvim_state",
             return_value=(77, {"buffers": [], "windows": []}),
         ):
@@ -96,12 +99,12 @@ class TestCleanTreeWindows(CleanTreeTestCase):
         snap.write_text("vim session", encoding="utf-8")
         with (
             unittest.mock.patch.object(
-                st_mod,
+                kitty_mod,
                 "get_terminal_nvim_state",
                 return_value=(77, {"buffers": [{"name": "/x", "buftype": ""}]}),
             ),
             unittest.mock.patch.object(
-                st_mod, "create_manager_snapshot", return_value=(True, None)
+                kitty_mod, "create_manager_snapshot", return_value=(True, None)
             ),
         ):
             node = tree_window("kitty", name="kitty", pid=10)
@@ -114,7 +117,7 @@ class TestCleanTreeWindows(CleanTreeTestCase):
 
     def test_zathura_window(self):
         with unittest.mock.patch.object(
-            st_mod, "get_zathura_info", return_value=("/docs/x.pdf", 3)
+            zathura_mod, "get_zathura_info", return_value=("/docs/x.pdf", 3)
         ):
             node = tree_window("org.pwmt.zathura", pid=10)
             result = st_mod.clean_tree(node, FakeCache())
@@ -124,12 +127,14 @@ class TestCleanTreeWindows(CleanTreeTestCase):
     def test_calibre_viewer_window(self):
         with (
             unittest.mock.patch.object(
-                st_mod,
+                calibre_mod,
                 "calibre_title_from_window",
                 return_value=("My Book", "EPUB"),
             ),
             unittest.mock.patch.object(
-                st_mod, "get_ebook_viewer_document", return_value="/books/my.epub"
+                calibre_mod,
+                "get_ebook_viewer_document",
+                return_value="/books/my.epub",
             ),
         ):
             node = tree_window(
