@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .mypy_cache/
 .ruff_cache/
+.coverage
+.pytest_cache/
+.cordprivate
 # `make check` and `make format` resolve their on-demand tooling through uv,
 # which refreshes this file in the working tree.
 uv.lock

@@ -21,6 +21,8 @@ on this file.
   versioned `Snapshot` to the backend's state file.
 - `restore` parses the snapshot, materializes each saved window, places it by
   container id, applies decorations, and reports what did not come back.
+- `docs/restore-design.md` records the four-phase model and its invariants;
+  read it before changing restore.
 - `model.py` owns the saved-session contract and per-node validation.
 - `ipc.py` owns the Sway/i3 wire protocol: a shared request/reply connection
   plus dedicated connections for event subscriptions.
