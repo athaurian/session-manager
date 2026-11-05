@@ -102,6 +102,20 @@ class WindowRegistry:
         with self._lock:
             self._results[id(node)] = win_id
 
+    def adopt(self, node: dict, win_id: int) -> None:
+        """Bind a saved node to a live window that is already there.
+
+        A restore over a session that partly survived, such as one that was
+        interrupted mid-run, reuses those windows instead of launching
+        duplicates. The node counts as materialized because it needs no
+        launch.
+        """
+        done = threading.Event()
+        done.set()
+        with self._lock:
+            self._events[id(node)] = done
+            self._results[id(node)] = win_id
+
     def has(self, node: dict) -> bool:
         """Report whether this node was submitted for materialization."""
         with self._lock:

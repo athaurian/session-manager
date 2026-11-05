@@ -826,6 +826,153 @@ class TestWorkspacePlacement(RestoreHarnessTestCase):
             self.assertEqual(self.restore_mod._window_workspace_name(4242), "1")
 
 
+class TestLiveWindowPlacements(unittest.TestCase):
+    """The reconcile pass reads each live window's workspace from the tree."""
+
+    def test_windows_map_to_the_workspace_that_holds_them(self):
+        tree = {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": "1",
+                            "nodes": [
+                                {
+                                    "type": "con",
+                                    "id": 20,
+                                    "nodes": [
+                                        {"type": "con", "id": 11, "app_id": "kitty"}
+                                    ],
+                                    "floating_nodes": [],
+                                }
+                            ],
+                            "floating_nodes": [
+                                {"type": "floating_con", "id": 12, "app_id": "kitty"}
+                            ],
+                        },
+                        {
+                            "type": "workspace",
+                            "name": "__i3_scratch",
+                            "nodes": [{"type": "con", "id": 13, "app_id": "mpv"}],
+                            "floating_nodes": [],
+                        },
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+        from session_manager.restore import _live_window_placements
+
+        self.assertEqual(
+            _live_window_placements(tree),
+            {11: "1", 12: "1", 13: "__i3_scratch"},
+        )
+
+
+class TestReconcilePlacements(RestoreHarnessTestCase):
+    """Placement drift after arrangement is repaired by con id."""
+
+    def _ctx(self, *adopted):
+        ctx = self.restore_mod.RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        for node, win_id in adopted:
+            ctx.registry.adopt(node, win_id)
+        return ctx
+
+    def _reconcile(self, ctx, before, after, workspaces=(), hidden=()):
+        with unittest.mock.patch.object(
+            self.restore_mod,
+            "_read_window_placements",
+            side_effect=[before, after],
+        ):
+            self.restore_mod._reconcile_placements(list(workspaces), list(hidden), ctx)
+
+    def test_window_on_the_wrong_workspace_is_moved_back(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        with unittest.mock.patch.object(
+            self.restore_mod, "_window_workspace_name", lambda _win_id: "9"
+        ):
+            self._reconcile(ctx, {501: "9"}, {501: "1"}, workspaces=[ws])
+        self.assertCommand("[con_id=501] move to workspace 1")
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_window_that_did_not_move_is_reported(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 502))
+        with unittest.mock.patch.object(
+            self.restore_mod, "_window_workspace_name", lambda _win_id: "9"
+        ):
+            self._reconcile(ctx, {502: "9"}, {502: "9"}, workspaces=[ws])
+        self.assertTrue(
+            any("still on workspace" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_window_already_placed_is_left_alone(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 503))
+        self._reconcile(ctx, {503: "1"}, {503: "1"}, workspaces=[ws])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ctx.failures, [])
+
+    def test_hidden_window_left_visible_is_parked_again(self):
+        from session_manager.config import SCRATCHPAD_WORKSPACE
+
+        win = make_window("kitty", name="alpha")
+        ctx = self._ctx((win, 601))
+        names = iter(["1", SCRATCHPAD_WORKSPACE])
+        with unittest.mock.patch.object(
+            self.restore_mod, "_window_workspace_name", lambda _win_id: next(names)
+        ):
+            self._reconcile(ctx, {601: "1"}, {601: "1"}, hidden=[win])
+        self.assertCommand("[con_id=601] move scratchpad")
+        self.assertNotIn("scratchpad show", " ".join(self.calls))
+        self.assertEqual(ctx.failures, [])
+
+    def test_hidden_window_already_parked_is_left_alone(self):
+        from session_manager.config import SCRATCHPAD_WORKSPACE
+
+        win = make_window("kitty", name="alpha")
+        ctx = self._ctx((win, 602))
+        self._reconcile(ctx, {602: SCRATCHPAD_WORKSPACE}, {}, hidden=[win])
+        self.assertEqual(self.calls, [])
+
+    def test_vanished_window_is_reported_missing(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 701))
+        self._reconcile(ctx, {}, {}, workspaces=[ws])
+        self.assertEqual(ctx.missing, ["alpha"])
+
+    def test_unmaterialized_node_is_skipped(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx()
+        self._reconcile(ctx, {}, {}, workspaces=[ws])
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(self.calls, [])
+
+    def test_unreadable_tree_skips_reconcile(self):
+        win = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 702))
+        with unittest.mock.patch.object(
+            self.restore_mod, "_read_window_placements", return_value=None
+        ):
+            self.restore_mod._reconcile_placements([ws], [], ctx)
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(self.calls, [])
+
+
 class TestHiddenScratchpad(RestoreHarnessTestCase):
     """Hidden scratchpad windows stay hidden, and groups are not dropped."""
 

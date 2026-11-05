@@ -34,7 +34,9 @@ from .config import (
 from .ipc import (
     close_connection,
     get_tree,
+    is_window_node,
     node_app_id,
+    node_pid,
     run_command,
     run_command_logged,
     walk_tree,
@@ -136,6 +138,85 @@ def _iter_windows(node: dict) -> Iterator[dict]:
         yield from _iter_windows(child)
 
 
+def _same_app_identity(live: dict, saved: dict) -> bool:
+    """Report whether a live window carries a saved window's app identity."""
+    app_id = saved.get("app_id")
+    if isinstance(app_id, str) and app_id:
+        return node_app_id(live) == canonical_app_id(app_id)
+    class_name = saved.get("class")
+    return (
+        isinstance(class_name, str)
+        and bool(class_name)
+        and node_app_id(live) == canonical_app_id(class_name)
+    )
+
+
+def _same_saved_window(live: dict, saved: dict, live_pid: int) -> bool:
+    """Report whether the pid or the exact title also identifies the window.
+
+    App identity alone is not enough, because one session can hold several
+    windows of the same application.
+    """
+    pid = saved.get("pid")
+    if isinstance(pid, int) and pid > 0 and live_pid == pid:
+        return True
+    name = saved.get("name")
+    return isinstance(name, str) and bool(name) and live.get("name") == name
+
+
+def _live_window_nodes(tree: dict) -> list[dict]:
+    """Return the window containers in a live tree."""
+    return [
+        node
+        for node in walk_tree(tree)
+        if node.get("type") in ("con", "floating_con") and is_window_node(node)
+    ]
+
+
+def _adopt_live_windows(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Reuse saved windows that are already live instead of launching them.
+
+    A restore that was interrupted, or one run over a session that is still
+    up, should heal what survived rather than duplicate every window. Each
+    live window is claimed at most once, so two saved windows never resolve
+    to the same one.
+
+    Helium nodes are left to the browser group restore, which already
+    matches its windows by title.
+    """
+    candidates = [node for node in nodes if node_app_id(node) != "helium"]
+    if not candidates:
+        return
+    try:
+        live_windows = _live_window_nodes(get_tree())
+    except OSError as exc:
+        log.info("Cannot read the live tree to reuse windows: %s", exc)
+        return
+
+    # i3 reports no pid on the container, so the X11 lookup runs only for a
+    # window that already matches the app and only once per live window.
+    live_pids: dict[int, int] = {}
+    reused = 0
+    for node in candidates:
+        for live in live_windows:
+            win_id = live["id"]
+            if win_id in ctx.claimed_ids:
+                continue
+            if not _same_app_identity(live, node):
+                continue
+            if win_id not in live_pids:
+                live_pids[win_id] = node_pid(live)
+            if not _same_saved_window(live, node, live_pids[win_id]):
+                continue
+            ctx.claimed_ids.add(win_id)
+            ctx.registry.adopt(node, win_id)
+            reused += 1
+            log.info("Reusing live window %s for %s", win_id, _failure_label(node))
+            break
+    if reused:
+        log.info("Reused %d live window(s) instead of launching them", reused)
+
+
 # Launchers that wait for the window owned by the process they started. Those
 # are safe to run concurrently even for the same application.
 _PID_MATCHED = frozenset({"kitty", "kitty_drop", "thunar", "mpv", "org.pwmt.zathura"})
@@ -187,12 +268,14 @@ def _start_materialization(
 
 
 def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
-    """Launch every window in `nodes` and wait before anything is placed.
+    """Launch the windows in `nodes`, then wait before anything is placed.
 
-    Waiting matters: a window that maps while the walk is issuing `split` or
+    Windows that were reused from the live tree need no launch. Waiting
+    matters: a window that maps while the walk is issuing `split` or
     `layout` can steal focus and reshape the wrong container.
     """
-    for event in _start_materialization(nodes, ctx):
+    pending = [node for node in nodes if not ctx.registry.has(node)]
+    for event in _start_materialization(pending, ctx):
         event.wait()
 
 
@@ -318,6 +401,105 @@ def _park_in_scratchpad(win_id: int, node: dict, ctx: RestoreContext) -> None:
         sleep(0.05)
         cmd(f"[con_id={win_id}] move scratchpad")
     ctx.add_failure(f"{_failure_label(node)}: still visible after move scratchpad")
+
+
+def _live_window_placements(tree: dict) -> dict[int, str | None]:
+    """Map every live window id to the workspace that holds it."""
+    placements: dict[int, str | None] = {}
+
+    def walk(node: dict, workspace: str | None) -> None:
+        """Collect window ids with the workspace they sit in."""
+        if node.get("type") == "workspace":
+            name = node.get("name")
+            workspace = name if isinstance(name, str) else None
+        if (
+            node.get("type") in ("con", "floating_con")
+            and is_window_node(node)
+            and node.get("id") is not None
+        ):
+            placements[node["id"]] = workspace
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(child, workspace)
+
+    walk(tree, None)
+    return placements
+
+
+def _read_window_placements() -> dict[int, str | None] | None:
+    """Return live window placements, or None when the tree is unreadable."""
+    try:
+        return _live_window_placements(get_tree())
+    except OSError:
+        return None
+
+
+def _placed_window_id(node: dict, ctx: RestoreContext) -> int | None:
+    """Return the live id of a saved node that went through materialization."""
+    if not ctx.registry.has(node):
+        return None
+    return ctx.registry.resolve(node)
+
+
+def _reconcile_placements(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> None:
+    """Move restored windows that drifted back to where they were saved.
+
+    Placement is asserted during the walk, but an application can move its
+    own window afterwards, and a window can map after its workspace was
+    arranged. One pass over the live tree repairs those windows by con id
+    and verifies the repair, so a partly healed session converges instead of
+    reporting success with windows in the wrong place.
+    """
+    placements = _read_window_placements()
+    if placements is None:
+        return
+
+    moved: dict[int, tuple[dict, str]] = {}
+    for workspace in workspaces:
+        name = workspace.get("name")
+        if not isinstance(name, str):
+            continue
+        for node in _iter_windows(workspace):
+            win_id = _placed_window_id(node, ctx)
+            if win_id is None:
+                continue
+            if win_id not in placements:
+                _record_missing(ctx, node)
+                continue
+            if placements[win_id] == name:
+                continue
+            _ensure_on_workspace(win_id, name)
+            moved[win_id] = (node, name)
+
+    for node in hidden_scratchpad:
+        for window in _iter_windows(node):
+            win_id = _placed_window_id(window, ctx)
+            if win_id is None:
+                continue
+            if win_id not in placements:
+                _record_missing(ctx, window)
+                continue
+            if placements[win_id] == SCRATCHPAD_WORKSPACE:
+                continue
+            _park_in_scratchpad(win_id, window, ctx)
+
+    if not moved:
+        return
+    after = _read_window_placements()
+    if after is None:
+        return
+    for win_id, (node, name) in moved.items():
+        if win_id not in after:
+            # The window closed after the move; whatever was lost is already
+            # reported as missing or failed.
+            continue
+        if after[win_id] != name:
+            ctx.add_failure(
+                f"{_failure_label(node)}: still on workspace {after[win_id]!r}, "
+                f"expected {name!r}"
+            )
+    log.info("Reconciled %d misplaced window(s)", len(moved))
 
 
 def has_restorable_content() -> bool:
@@ -1054,6 +1236,13 @@ def _restore_session_locked(
         # its saved container; a window already on its target workspace would
         # be left where it is and the nesting would not be rebuilt.
         visible_windows = [win for ws in workspaces for win in _iter_windows(ws)]
+        hidden_windows = [
+            win for node in hidden_scratchpad for win in _iter_windows(node)
+        ]
+        # A restore that was interrupted leaves some of its windows live. A
+        # rerun reuses those instead of launching a second copy of the app,
+        # so the session converges instead of doubling.
+        _adopt_live_windows(visible_windows + hidden_windows, ctx)
         if visible_windows:
             cmd(_workspace_cmd(RESTORE_STAGING_WORKSPACE))
         _materialize(visible_windows, ctx)
@@ -1083,6 +1272,12 @@ def _restore_session_locked(
                 except Exception as exc:
                     partial_failures.append(f"hidden scratchpad: {exc}")
                     log.exception("Failed to restore hidden scratchpad window")
+
+        # Reconcile after every workspace is arranged. Windows can drift
+        # after the walk places them, and an interrupted restore leaves some
+        # of them elsewhere; this pass moves them back by con id and verifies
+        # the result before the session is reported as restored.
+        _reconcile_placements(workspaces, hidden_scratchpad, ctx)
 
         # Windows that failed on their own are collected here, so the
         # summary can report them without aborting the session.

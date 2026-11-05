@@ -268,6 +268,106 @@ class TestMaterializeBeforeArrange(MaterializeHarness):
         self.assertTrue(any(c.endswith("] focus") for c in self.calls))
 
 
+def live_window(win_id, app_id="kitty", name="alpha", pid=12345):
+    """Build a live tree container for ad\u2011hoc trees."""
+    return {
+        "type": "con",
+        "id": win_id,
+        "app_id": app_id,
+        "name": name,
+        "pid": pid,
+        "nodes": [],
+        "floating_nodes": [],
+    }
+
+
+class TestAdoptLiveWindows(MaterializeHarness):
+    """A rerun reuses windows that survived instead of launching copies."""
+
+    def _adopt(self, saved, live):
+        ctx = self.make_context()
+        tree = {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "nodes": [make_workspace("1", nodes=live)],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+        with unittest.mock.patch.object(restore_mod, "get_tree", lambda: tree):
+            restore_mod._adopt_live_windows(saved, ctx)
+        return ctx
+
+    def test_window_with_the_saved_pid_is_reused(self):
+        saved = make_window("kitty", name="alpha", pid=12345)
+        ctx = self._adopt([saved], [live_window(777, name="renamed", pid=12345)])
+        self.assertEqual(ctx.registry.resolve(saved), 777)
+        self.assertIn(777, ctx.claimed_ids)
+
+    def test_window_whose_pid_needs_an_x11_lookup_is_reused(self):
+        saved = make_window("kitty", name="renamed", pid=12345)
+        live = live_window(784, name="default title")
+        del live["pid"]
+        with unittest.mock.patch.object(restore_mod, "node_pid", lambda _node: 12345):
+            ctx = self._adopt([saved], [live])
+        self.assertEqual(ctx.registry.resolve(saved), 784)
+
+    def test_window_with_the_saved_title_is_reused(self):
+        saved = make_window("kitty", name="alpha", pid=111)
+        ctx = self._adopt([saved], [live_window(778, name="alpha", pid=222)])
+        self.assertEqual(ctx.registry.resolve(saved), 778)
+
+    def test_same_app_with_a_different_title_is_not_reused(self):
+        saved = make_window("kitty", name="alpha", pid=111)
+        ctx = self._adopt([saved], [live_window(779, name="beta", pid=222)])
+        self.assertFalse(ctx.registry.has(saved))
+        self.assertEqual(len(ctx.claimed_ids), 0)
+
+    def test_different_app_with_the_saved_title_is_not_reused(self):
+        saved = make_window("kitty", name="alpha", pid=111)
+        ctx = self._adopt([saved], [live_window(780, app_id="mpv", name="alpha")])
+        self.assertFalse(ctx.registry.has(saved))
+
+    def test_one_live_window_is_reused_at_most_once(self):
+        saved_a = make_window("kitty", name="alpha", pid=111)
+        saved_b = make_window("kitty", name="alpha", pid=222)
+        ctx = self._adopt([saved_a, saved_b], [live_window(781, name="alpha")])
+        self.assertEqual(ctx.registry.resolve(saved_a), 781)
+        self.assertFalse(ctx.registry.has(saved_b))
+        self.assertEqual(list(ctx.claimed_ids), [781])
+
+    def test_helium_is_left_to_the_browser_group(self):
+        saved = make_window("helium", name="tab", pid=111)
+        ctx = self._adopt([saved], [live_window(782, app_id="helium", name="tab")])
+        self.assertFalse(ctx.registry.has(saved))
+
+    def test_unreadable_tree_falls_back_to_launching(self):
+        saved = make_window("kitty", name="alpha")
+        ctx = self.make_context()
+        with unittest.mock.patch.object(
+            restore_mod, "get_tree", side_effect=OSError("no socket")
+        ):
+            restore_mod._adopt_live_windows([saved], ctx)
+        self.assertFalse(ctx.registry.has(saved))
+
+    def test_materialize_does_not_relaunch_a_reused_window(self):
+        ctx = self.make_context()
+        saved = make_window("kitty", name="alpha")
+        ctx.registry.adopt(saved, 783)
+        with unittest.mock.patch.object(
+            restore_mod,
+            "launch_and_get_id",
+            side_effect=AssertionError("a reused window must not launch"),
+        ):
+            restore_mod._materialize([saved], ctx)
+        self.assertEqual(ctx.registry.resolve(saved), 783)
+
+
 class TestRegistryFallback(MaterializeHarness):
     def test_unmaterialized_node_falls_back_to_launching(self):
         ctx = self.make_context()

@@ -74,6 +74,26 @@ assert {w[0] for w in windows} == {'1', '2'}, windows
 print('saved windows:', windows)
 PY
 
+echo '--- restore over the live session reuses its windows ---'
+python3 -m session_manager restore --quiet
+sleep 3
+i3-msg -t get_tree >/tmp/tree.json
+python3 /src/tests/integration/verify.py \
+    --saved "$XDG_STATE_HOME/i3_session.json" --tree /tmp/tree.json
+
+# A partly live session must heal, not double. One window drifted to another
+# workspace and the other is gone; restore has to move the survivor back,
+# relaunch only the missing window, and duplicate neither.
+echo '--- restore heals a partly live session ---'
+i3-msg '[title="^alpha$"] move container to workspace 2' >/dev/null
+i3-msg '[title="^beta$"] kill' >/dev/null
+sleep 2
+python3 -m session_manager restore --quiet
+sleep 3
+i3-msg -t get_tree >/tmp/tree.json
+python3 /src/tests/integration/verify.py \
+    --saved "$XDG_STATE_HOME/i3_session.json" --tree /tmp/tree.json
+
 pkill -x xterm 2>/dev/null || true
 sleep 2
 python3 -m session_manager restore --quiet
