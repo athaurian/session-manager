@@ -24,6 +24,8 @@ class TestUnreachableCompositor(unittest.TestCase):
         stderr = io.StringIO()
         with (
             unittest.mock.patch("sys.argv", ["session_manager", action]),
+            # The tests must never rewrite the developer's environment.
+            unittest.mock.patch.object(restore_mod, "apply_compositor_env"),
             redirect_stderr(stderr),
             self.assertRaises(SystemExit) as raised,
         ):
@@ -86,6 +88,10 @@ class TestExitCodes(unittest.TestCase):
         code = 0
         with (
             unittest.mock.patch("sys.argv", ["session_manager", action]),
+            unittest.mock.patch.object(restore_mod, "apply_compositor_env"),
+            # A test run must never pop a desktop notification.
+            unittest.mock.patch.object(save_mod, "notify"),
+            unittest.mock.patch.object(restore_mod, "notify"),
             redirect_stderr(stderr),
             redirect_stdout(stdout),
         ):
