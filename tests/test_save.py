@@ -10,6 +10,7 @@ from pathlib import Path
 
 import session_manager.save as save_mod
 from session_manager.ipc import IpcError
+from session_manager.model import CURRENT_VERSION
 from tests.helpers import make_window, make_workspace
 
 
@@ -134,7 +135,7 @@ class TestSaveSession(unittest.TestCase):
             save_mod.save_session(notify_user=False)
 
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], CURRENT_VERSION)
         self.assertEqual(payload["focused_workspace"], "1")
         self.assertEqual(len(payload["workspaces"]), 1)
         self.assertEqual(payload["workspaces"][0]["name"], "1")
@@ -192,7 +193,7 @@ class TestSaveSession(unittest.TestCase):
         with unittest.mock.patch.object(Path, "replace", side_effect=OSError("busy")):
             self._save()
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], CURRENT_VERSION)
 
     def test_failed_write_leaves_the_previous_state_in_place(self):
         self.state_file.write_text("current", encoding="utf-8")

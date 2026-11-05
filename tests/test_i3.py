@@ -451,7 +451,9 @@ class TestI3Geometry(RestoreHarnessTestCase):
         self.restore_mod._restore_hidden_scratchpad(
             make_window("kitty", marks=["s"]), self.restore_mod.RestoreContext()
         )
-        self.assertNotIn("workspace __scratch_restore", " ".join(self.calls))
+        self.assertNotIn(
+            f"workspace {cfg_mod.SCRATCH_RESTORE_WORKSPACE}", " ".join(self.calls)
+        )
 
 
 class TestI3Restore(RestoreHarnessTestCase):
