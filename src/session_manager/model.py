@@ -13,10 +13,17 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import SCRATCHPAD_WORKSPACE
+
 CURRENT_VERSION = 3
 SUPPORTED_VERSIONS = frozenset({1, 2, 3})
 
 _NODE_TYPES = frozenset({"workspace", "con", "window"})
+
+# Workspaces the compositor owns. The scratchpad's windows are saved
+# separately, so a workspace with this name in a payload is a damaged or
+# hand-edited file rather than a user's workspace.
+RESERVED_WORKSPACE_NAMES = frozenset({SCRATCHPAD_WORKSPACE})
 
 
 class StateValidationError(ValueError):
@@ -101,12 +108,23 @@ def _clean_node(node: Any, path: str, issues: list[str]) -> dict[str, Any] | Non
         if "app_id" in cleaned and not isinstance(cleaned["app_id"], str):
             issues.append(f"{path}.app_id must be a string; dropped")
             cleaned.pop("app_id", None)
+        if "scratchpad_state" in cleaned:
+            state = cleaned["scratchpad_state"]
+            if not isinstance(state, str):
+                issues.append(f"{path}.scratchpad_state must be a string; dropped")
+                cleaned.pop("scratchpad_state", None)
+            elif not state:
+                issues.append(f"{path}.scratchpad_state is empty; using none")
+                cleaned["scratchpad_state"] = "none"
         return cleaned
 
     if ntype == "workspace":
         name = cleaned.get("name")
         if not isinstance(name, str) or not name:
             issues.append(f"{path}.name must be a non-empty string; dropped")
+            return None
+        if name in RESERVED_WORKSPACE_NAMES:
+            issues.append(f"{path}.name {name!r} is reserved; dropped")
             return None
         if "output" in cleaned and not isinstance(cleaned["output"], str):
             issues.append(f"{path}.output must be a string; dropped")
@@ -230,6 +248,8 @@ class Snapshot:
         if raw_focused is not None:
             if not isinstance(raw_focused, str) or not raw_focused:
                 issues.append("focused_workspace must be a non-empty string; dropped")
+            elif raw_focused in RESERVED_WORKSPACE_NAMES:
+                issues.append(f"focused_workspace {raw_focused!r} is reserved; dropped")
             else:
                 focused_workspace = raw_focused
 

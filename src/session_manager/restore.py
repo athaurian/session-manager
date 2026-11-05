@@ -19,6 +19,7 @@ from .apps.helium import (
     get_helium_restored_id,
     restore_helium_group,
 )
+from .apps.kitty import classify_kitty
 from .background import restore_background_apps
 from .config import (
     DEFAULT_WINDOW_HEIGHT,
@@ -146,7 +147,13 @@ def _same_app_identity(live: dict, saved: dict) -> bool:
     """Report whether a live window carries a saved window's app identity."""
     app_id = saved.get("app_id")
     if isinstance(app_id, str) and app_id:
-        return node_app_id(live) == canonical_app_id(app_id)
+        saved_id = canonical_app_id(app_id)
+        if saved_id == "kitty_drop":
+            # The dropdown is a kitty window with its own instance, title, or
+            # mark. A plain kitty window must not stand in for it, so the
+            # same classifier that saved it decides the match.
+            return classify_kitty(live, node_app_id(live)) == "kitty_drop"
+        return node_app_id(live) == saved_id
     class_name = saved.get("class")
     return (
         isinstance(class_name, str)
@@ -335,18 +342,17 @@ def _window_workspace_name(win_id: int) -> str | None:
     return _find(tree, None)
 
 
-def _focused_depth_in_workspace(name: str) -> int | None:
+def _focused_depth_in_workspace(name: str, tree: dict | None) -> int | None:
     """Return how many `focus parent` steps reach a workspace root.
 
     None means the workspace is not in the live tree, so the caller should
     fall back to a best-effort single step.
     """
-    try:
-        tree = get_tree()
-    except OSError:
+    if tree is None:
         return None
 
     def find_workspace(node: dict) -> dict | None:
+        """Find the workspace with the given name."""
         if node.get("type") == "workspace" and node.get("name") == name:
             return node
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
@@ -356,6 +362,7 @@ def _focused_depth_in_workspace(name: str) -> int | None:
         return None
 
     def focused_depth(node: dict, depth: int) -> int | None:
+        """Return the depth of the focused node inside this subtree."""
         if node.get("focused"):
             return depth
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
@@ -372,7 +379,7 @@ def _focused_depth_in_workspace(name: str) -> int | None:
     return 0 if depth is None else depth
 
 
-def _focus_workspace_root(name: str) -> None:
+def _focus_workspace_root(name: str, tree: dict | None) -> None:
     """Focus a workspace container so the next window lands at its root.
 
     Switching to a workspace focuses its last focused child. Without this, a
@@ -380,7 +387,7 @@ def _focus_workspace_root(name: str) -> None:
     container instead of beside it. Workspaces cannot be focused by con_id,
     so walk up from the focused child instead.
     """
-    depth = _focused_depth_in_workspace(name)
+    depth = _focused_depth_in_workspace(name, tree)
     if depth is None:
         run_command("focus parent")
         return
@@ -388,7 +395,25 @@ def _focus_workspace_root(name: str) -> None:
         cmd("focus parent")
 
 
-def _ensure_on_workspace(win_id: int, workspace: str | None) -> None:
+def _read_tree(ctx: RestoreContext) -> dict | None:
+    """Read the live tree and cache the window placements it holds.
+
+    The arrangement asks the tree two questions per window: how deep the
+    focus is, and which workspace a window is on. One read answers both,
+    so the walk does not cost an IPC round trip per question.
+    """
+    try:
+        tree = get_tree()
+    except OSError:
+        ctx.placements = None
+        return None
+    ctx.placements = _live_window_placements(tree)
+    return tree
+
+
+def _ensure_on_workspace(
+    win_id: int, workspace: str | None, ctx: RestoreContext
+) -> None:
     """Move a window to the workspace being restored, if it is elsewhere.
 
     Placement must never depend on which workspace happens to be focused when
@@ -396,25 +421,38 @@ def _ensure_on_workspace(win_id: int, workspace: str | None) -> None:
     """
     if not workspace:
         return
-    if _window_workspace_name(win_id) == workspace:
+    if ctx.placements is not None:
+        current = ctx.placements.get(win_id)
+    else:
+        current = _window_workspace_name(win_id)
+    if current == workspace:
         return
     cmd(_move_to_workspace_cmd(win_id, workspace))
     cmd(_workspace_cmd(workspace))
+    if ctx.placements is not None:
+        ctx.placements[win_id] = workspace
 
 
 def _park_in_scratchpad(win_id: int, node: dict, ctx: RestoreContext) -> None:
-    """Hide a window in the scratchpad and verify that it left the desktop."""
-    cmd(f"[con_id={win_id}] move scratchpad")
-    for _attempt in range(3):
+    """Hide a window in the scratchpad and verify that it left the desktop.
+
+    Every move is followed by a check, so the last move is verified too. A
+    window that is no longer in the tree cannot be verified, and that is
+    reported rather than counted as a successful park.
+    """
+    for attempt in range(3):
+        cmd(f"[con_id={win_id}] move scratchpad")
         workspace = _window_workspace_name(win_id)
         if workspace == SCRATCHPAD_WORKSPACE:
             return
         if workspace is None:
-            # The window is not in the tree yet, or it has closed. There is
-            # nothing to correct and nothing that can be verified.
+            # The window is not in the tree, so the park cannot be verified.
+            ctx.add_failure(
+                f"{_failure_label(node)}: window vanished before it was parked"
+            )
             return
-        time.sleep(0.05)
-        cmd(f"[con_id={win_id}] move scratchpad")
+        if attempt < 2:
+            time.sleep(0.05)
     ctx.add_failure(f"{_failure_label(node)}: still visible after move scratchpad")
 
 
@@ -468,7 +506,11 @@ def _reconcile_placements(
     """
     placements = _read_window_placements()
     if placements is None:
+        ctx.placements = None
         return
+    # The reconcile pass works from a fresh tree, so the cached
+    # placements have to match it.
+    ctx.placements = placements
 
     moved: dict[int, tuple[dict, str]] = {}
     for workspace in workspaces:
@@ -484,7 +526,7 @@ def _reconcile_placements(
                 continue
             if placements[win_id] == name:
                 continue
-            _ensure_on_workspace(win_id, name)
+            _ensure_on_workspace(win_id, name, ctx)
             moved[win_id] = (node, name)
 
     for node in hidden_scratchpad:
@@ -602,6 +644,8 @@ def _recover_staged_windows(
     A slow application can create its window after the wait has already
     reported it missing. The window still belongs to this restore, so it is
     matched to its saved node, placed, and removed from the missing list.
+    A window is only matched when its pid or its exact title identifies it
+    as well, so one window of an application cannot stand in for another.
     Windows that match nothing are moved off staging and reported, so the
     staging workspace can always be removed.
     """
@@ -615,6 +659,9 @@ def _recover_staged_windows(
         return 0
 
     placements = _live_window_placements(tree)
+    # The recovery pass works from a fresh tree, so the cached placements
+    # have to match it.
+    ctx.placements = placements
     targets = _saved_window_targets(workspaces, hidden_scratchpad)
     pending = [
         target
@@ -623,27 +670,28 @@ def _recover_staged_windows(
     ]
 
     used: set[int] = set()
+    live_pids: dict[int, int] = {}
     recovered = 0
     for live in staged:
         win_id = live["id"]
         if win_id in ctx.claimed_ids:
             continue
-        exact: tuple[dict, str | None, bool] | None = None
-        identity: tuple[dict, str | None, bool] | None = None
+        match: tuple[dict, str | None, bool] | None = None
         for target in pending:
             node = target[0]
             if id(node) in used:
                 continue
             if not _same_app_identity(live, node):
                 continue
-            if isinstance(node.get("name"), str) and live.get("name") == node.get(
-                "name"
-            ):
-                exact = target
-                break
-            if identity is None:
-                identity = target
-        match = exact or identity
+            # The pid or the exact title has to identify the window too.
+            # App identity alone would let one window of an application
+            # stand in for another one.
+            if win_id not in live_pids:
+                live_pids[win_id] = node_pid(live)
+            if not _same_saved_window(live, node, live_pids[win_id]):
+                continue
+            match = target
+            break
         if match is None:
             continue
         node, workspace, floating = match
@@ -678,7 +726,7 @@ def _recover_staged_windows(
             continue
         label = str(live.get("name") or node_app_id(live) or win_id)
         ctx.add_failure(f"{label}: restored window did not match a saved window")
-        _ensure_on_workspace(win_id, fallback)
+        _ensure_on_workspace(win_id, fallback, ctx)
 
     if recovered:
         log.info("Recovered %d late window(s) from staging", recovered)
@@ -691,12 +739,15 @@ def _finish_staging(
     ctx: RestoreContext,
     destination: str,
 ) -> None:
-    """Leave the staging workspaces and sweep anything that mapped late."""
-    cmd(_workspace_cmd(destination))
-    if not _staging_workspace_names():
-        return
-    _recover_staged_windows(workspaces, hidden_scratchpad, ctx)
-    _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+    """Leave the staging workspaces and sweep anything that mapped late.
+
+    The sweep runs before the switch to the destination, so a window that
+    maps while it is running lands on the staging workspace and is found
+    there instead of on the destination.
+    """
+    if _staging_workspace_names():
+        _recover_staged_windows(workspaces, hidden_scratchpad, ctx)
+        _reconcile_placements(workspaces, hidden_scratchpad, ctx)
     cmd(_workspace_cmd(destination))
     remaining = _staging_workspace_names()
     if remaining:
@@ -720,7 +771,12 @@ def has_restorable_content() -> bool:
         workspaces, hidden_scratchpad, background_apps, _ = _normalise_restore_payload(
             payload
         )
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         log.warning("Session file %s not restorable: %s", STATE_FILE, exc)
         return False
 
@@ -1071,7 +1127,7 @@ def _restore_floating(node: dict, ctx: RestoreContext) -> None:
         return
 
     _apply_marks(win_id, node.get("marks", []))
-    _ensure_on_workspace(win_id, ctx.current_workspace)
+    _ensure_on_workspace(win_id, ctx.current_workspace, ctx)
 
     rect = node.get("rect", {})
     fullscreen_mode = node.get("fullscreen_mode", 0)
@@ -1131,7 +1187,7 @@ def _restore_hidden_scratchpad(node: dict, ctx: RestoreContext) -> None:
     staging = (
         SCRATCH_RESTORE_WORKSPACE if detect_backend() != "i3" else ctx.current_workspace
     )
-    _ensure_on_workspace(win_id, staging)
+    _ensure_on_workspace(win_id, staging, ctx)
     cmd(f"[con_id={win_id}] floating enable")
     # Older state files predate the saved border, so fall back to the
     # chromed style those windows were restored with.
@@ -1179,15 +1235,15 @@ def _restore_node(
     if ntype == "workspace":
         ctx.current_workspace = node["name"]
         cmd(_workspace_cmd(node["name"]))
-        _focus_workspace_root(node["name"])
+        _focus_workspace_root(node["name"], _read_tree(ctx))
         _apply_layout(node["layout"])
         for child in node.get("nodes", []):
             cmd(_workspace_cmd(node["name"]))
-            _focus_workspace_root(node["name"])
+            _focus_workspace_root(node["name"], _read_tree(ctx))
             _restore_child(child, ctx, parent_layout=node["layout"])
         for child in node.get("floating_nodes", []):
             cmd(_workspace_cmd(node["name"]))
-            _focus_workspace_root(node["name"])
+            _focus_workspace_root(node["name"], _read_tree(ctx))
             _restore_floating_child(child, ctx)
 
     elif ntype == "con":
@@ -1208,7 +1264,7 @@ def _restore_node(
             _record_missing(ctx, node)
             return
         _apply_marks(win_id, node.get("marks", []))
-        _ensure_on_workspace(win_id, ctx.current_workspace)
+        _ensure_on_workspace(win_id, ctx.current_workspace, ctx)
         cmd(f"[con_id={win_id}] focus")
         _apply_fullscreen(win_id, node.get("fullscreen_mode", 0))
         _apply_percent(win_id, node.get("percent"), parent_layout or "")
@@ -1265,7 +1321,12 @@ def diff_sessions() -> bool:
         with open(STATE_FILE, encoding="utf-8") as f:
             payload = json.load(f)
         saved_ws, saved_hidden, saved_bg, _ = _normalise_restore_payload(payload)
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         print(f"Saved session unreadable: {exc}")
         return False
 
@@ -1406,7 +1467,12 @@ def _restore_session_locked(
                 urgency="critical",
                 timeout_ms=0,
             )
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         _notify("session restore skipped: invalid session file", urgency="normal")
         log.warning("Invalid session file %s: %s", STATE_FILE, exc)
         return

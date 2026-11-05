@@ -54,6 +54,12 @@ class RestoreContext:
     helium_restore_started: bool = False
     helium_materialized: bool = False
 
+    # Live window placements, from the last tree the restore read. The
+    # arrangement asks the tree two questions per window: how deep the
+    # focus is, and which workspace a window is on. One read answers
+    # both, and the map is kept up to date with every move.
+    placements: dict[int, str | None] | None = None
+
     # Whether the browser may replay its own last session. A restore that
     # covers only one workspace must not, because that would reopen the
     # browser windows saved on every other workspace.

@@ -93,6 +93,34 @@ class TestSnapshotRepair(unittest.TestCase):
         self.assertIsNone(snapshot.focused_workspace)
         self.assertTrue(snapshot.issues)
 
+    def test_a_non_string_scratchpad_state_is_dropped(self):
+        win = make_window("kitty", scratchpad_state=7)
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertNotIn("scratchpad_state", snapshot.workspaces[0]["nodes"][0])
+        self.assertTrue(snapshot.issues)
+
+    def test_an_empty_scratchpad_state_becomes_none(self):
+        win = make_window("kitty", scratchpad_state="")
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertEqual(snapshot.workspaces[0]["nodes"][0]["scratchpad_state"], "none")
+
+    def test_the_scratchpad_workspace_is_dropped(self):
+        """The compositor owns that workspace; it is never a user's one."""
+        scratch = make_workspace("__i3_scratch", nodes=[make_window("kitty")])
+        good = make_workspace("1", nodes=[make_window("kitty")])
+        snapshot = Snapshot.from_payload({"workspaces": [scratch, good]})
+        self.assertEqual([ws["name"] for ws in snapshot.workspaces], ["1"])
+        self.assertTrue(snapshot.issues)
+
+    def test_a_reserved_focused_workspace_is_dropped(self):
+        snapshot = Snapshot.from_payload(
+            {"workspaces": [], "focused_workspace": "__i3_scratch"}
+        )
+        self.assertIsNone(snapshot.focused_workspace)
+        self.assertTrue(snapshot.issues)
+
 
 if __name__ == "__main__":
     unittest.main()

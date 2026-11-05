@@ -348,6 +348,26 @@ class TestAdoptLiveWindows(MaterializeHarness):
         ctx = self._adopt([saved], [live_window(782, app_id="helium", name="tab")])
         self.assertFalse(ctx.registry.has(saved))
 
+    def test_live_dropdown_is_reused(self):
+        """The dropdown is a kitty window with its own title."""
+        saved = make_window("kitty_drop", name="drop_term", pid=111)
+        live = live_window(785, app_id="kitty", name="drop_term", pid=222)
+        ctx = self._adopt([saved], [live])
+        self.assertEqual(ctx.registry.resolve(saved), 785)
+
+    def test_live_dropdown_is_reused_by_its_instance(self):
+        saved = make_window("kitty_drop", name="drop_term", pid=222)
+        live = live_window(787, app_id="kitty", name="renamed", pid=222)
+        live["window_properties"] = {"class": "kitty", "instance": "scratchpad_term"}
+        ctx = self._adopt([saved], [live])
+        self.assertEqual(ctx.registry.resolve(saved), 787)
+
+    def test_plain_kitty_is_not_reused_for_the_dropdown(self):
+        saved = make_window("kitty_drop", name="drop_term", pid=111)
+        live = live_window(786, app_id="kitty", name="alpha", pid=222)
+        ctx = self._adopt([saved], [live])
+        self.assertFalse(ctx.registry.has(saved))
+
     def test_unreadable_tree_falls_back_to_launching(self):
         saved = make_window("kitty", name="alpha")
         ctx = self.make_context()

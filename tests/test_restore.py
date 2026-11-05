@@ -420,6 +420,31 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
                     p.stop()
         self.assertEqual(self.calls, [])
 
+    def test_a_session_file_that_is_not_utf8_skips_restore(self):
+        import tempfile
+        import unittest.mock
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "sway_session.json"
+            state_file.write_bytes(b'{"workspaces": [\xff]}')
+            extra = [
+                unittest.mock.patch.object(self.restore_mod, "STATE_FILE", state_file),
+                unittest.mock.patch.object(
+                    self.restore_mod, "operation_lock", lambda _dir: nullcontext()
+                ),
+                unittest.mock.patch.object(self.restore_mod, "close_connection"),
+            ]
+            for p in extra:
+                p.start()
+            try:
+                self.restore_mod._restore_session_locked(notify_user=False)
+            finally:
+                for p in extra:
+                    p.stop()
+        self.assertEqual(self.calls, [])
+
 
 class TestWorkspaceFilter(RestoreHarnessTestCase):
     """A filtered restore covers one workspace and nothing else."""
@@ -693,6 +718,18 @@ class TestHasRestorableContent(RestoreHarnessTestCase):
     def test_unreadable_json_is_not_restorable(self):
         self.assertFalse(self._check("{ not valid json"))
 
+    def test_a_file_that_is_not_utf8_is_not_restorable(self):
+        """A damaged state file must not raise out of the check."""
+        import tempfile
+        import unittest.mock
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "sway_session.json"
+            state_file.write_bytes(b'{"workspaces": [\xff]}')
+            with unittest.mock.patch.object(self.restore_mod, "STATE_FILE", state_file):
+                self.assertFalse(self.restore_mod.has_restorable_content())
+
     def test_structurally_invalid_payload_is_not_restorable(self):
         self.assertFalse(self._check("not a payload"))
 
@@ -894,10 +931,36 @@ class TestMultiOutputClamp(RestoreHarnessTestCase):
 class TestWorkspacePlacement(RestoreHarnessTestCase):
     """A window's workspace is asserted, not inherited from focus."""
 
+    def _tree_with(self, win_id, workspace):
+        """A live tree with one window on the given workspace."""
+        win = {
+            "type": "con",
+            "id": win_id,
+            "app_id": "kitty",
+            "name": "kitty window",
+            "pid": 12345,
+            "nodes": [],
+            "floating_nodes": [],
+        }
+        ws = make_workspace(workspace, nodes=[win])
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "nodes": [ws],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
     def test_window_on_the_wrong_workspace_is_moved_back(self):
         ws = make_workspace("1", nodes=[make_window("kitty", cwd="/a")])
         with unittest.mock.patch.object(
-            self.restore_mod, "_window_workspace_name", lambda _win_id: "9"
+            self.restore_mod, "get_tree", lambda: self._tree_with(1000, "9")
         ):
             self.restore_workspaces({"workspaces": [ws]})
         self.assertCommand("[con_id=1000] move to workspace 1")
@@ -905,7 +968,7 @@ class TestWorkspacePlacement(RestoreHarnessTestCase):
     def test_window_already_on_its_workspace_is_not_moved(self):
         ws = make_workspace("1", nodes=[make_window("kitty", cwd="/a")])
         with unittest.mock.patch.object(
-            self.restore_mod, "_window_workspace_name", lambda _win_id: "1"
+            self.restore_mod, "get_tree", lambda: self._tree_with(1000, "1")
         ):
             self.restore_workspaces({"workspaces": [ws]})
         self.assertNotIn("move to workspace 1", " ".join(self.calls))
@@ -913,7 +976,7 @@ class TestWorkspacePlacement(RestoreHarnessTestCase):
     def test_floating_window_on_the_wrong_workspace_is_moved_back(self):
         ws = make_workspace("1", floating=[make_window("kitty", cwd="/a")])
         with unittest.mock.patch.object(
-            self.restore_mod, "_window_workspace_name", lambda _win_id: "9"
+            self.restore_mod, "get_tree", lambda: self._tree_with(1000, "9")
         ):
             self.restore_workspaces({"workspaces": [ws]})
         self.assertCommand("[con_id=1000] move to workspace 1")
@@ -1199,6 +1262,44 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
         )
         self.assertCommand("[con_id=803] move to workspace 1")
 
+    def test_a_staged_window_without_the_saved_title_is_not_adopted(self):
+        """App identity alone must not let one window stand in for another."""
+        saved = make_window("kitty", name="alpha")
+        ws = make_workspace("7", nodes=[saved])
+        ctx = self._ctx()
+        tree = self._staging_tree(self._live(804, "kitty", "beta"))
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_window_workspace_name",
+                lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
+            ),
+        ):
+            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 0)
+        self.assertFalse(ctx.registry.has(saved))
+
+    def test_a_staged_window_with_the_saved_pid_is_adopted(self):
+        """The pid identifies the window even when the title changed."""
+        saved = make_window("kitty", name="alpha", pid=4242)
+        ws = make_workspace("7", nodes=[saved])
+        ctx = self._ctx()
+        tree = self._staging_tree(self._live(805, "kitty", "beta"))
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_window_workspace_name",
+                lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
+            ),
+        ):
+            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(ctx.registry.resolve(saved), 805)
+
     def test_finish_staging_sweeps_a_workspace_that_survived(self):
         ctx = self._ctx()
         with (
@@ -1216,10 +1317,34 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
         ):
             self.restore_mod._finish_staging([], [], ctx, "2")
 
-        self.assertEqual(self.calls, ["workspace 2", "workspace 2"])
+        self.assertEqual(self.calls, ["workspace 2"])
         recover.assert_called_once()
         reconcile.assert_called_once()
         self.assertEqual(ctx.failures, [])
+
+    def test_finish_staging_sweeps_before_switching_away(self):
+        """A window that maps during the sweep lands on staging, not the target."""
+        ctx = self._ctx()
+        calls_during_sweep: list[list[str]] = []
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_staging_workspace_names",
+                side_effect=[["_session_restore"], []],
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_recover_staged_windows",
+                side_effect=lambda *_a, **_kw: calls_during_sweep.append(
+                    list(self.calls)
+                ),
+            ),
+            unittest.mock.patch.object(self.restore_mod, "_reconcile_placements"),
+        ):
+            self.restore_mod._finish_staging([], [], ctx, "2")
+
+        self.assertEqual(calls_during_sweep, [[]])
+        self.assertEqual(self.calls, ["workspace 2"])
 
     def test_finish_staging_reports_a_workspace_that_will_not_leave(self):
         ctx = self._ctx()
@@ -1287,6 +1412,48 @@ class TestHiddenScratchpad(RestoreHarnessTestCase):
                 {"workspaces": [], "hidden_scratchpad": [win]}
             )
         self.assertEqual(ctx.failures, [])
+
+    def test_every_scratchpad_move_is_verified(self):
+        """The last move must be checked too, not assumed to have worked."""
+        from session_manager.config import SCRATCHPAD_WORKSPACE
+
+        win = make_window("kitty", cwd="/a")
+        moves = {"count": 0}
+
+        def record(command):
+            self.calls.append(command)
+            if "move scratchpad" in command:
+                moves["count"] += 1
+
+        def workspace_of(_win_id):
+            # The window only reaches the scratchpad once every move has
+            # been tried.
+            return SCRATCHPAD_WORKSPACE if moves["count"] >= 3 else "1"
+
+        with (
+            unittest.mock.patch.object(self.restore_mod, "cmd", record),
+            unittest.mock.patch.object(
+                self.restore_mod, "_window_workspace_name", workspace_of
+            ),
+        ):
+            ctx = self.restore_workspaces(
+                {"workspaces": [], "hidden_scratchpad": [win]}
+            )
+        self.assertEqual(ctx.failures, [])
+        self.assertEqual(moves["count"], 3)
+
+    def test_a_window_that_vanished_is_not_a_successful_park(self):
+        win = make_window("kitty", cwd="/a")
+        with unittest.mock.patch.object(
+            self.restore_mod, "_window_workspace_name", lambda _win_id: None
+        ):
+            ctx = self.restore_workspaces(
+                {"workspaces": [], "hidden_scratchpad": [win]}
+            )
+        self.assertTrue(
+            any("vanished" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
 
 
 if __name__ == "__main__":
