@@ -2,7 +2,6 @@
 event-driven title assignment loop.
 """
 
-import time
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -232,35 +231,6 @@ class TestHeliumEarlyReuse(HeliumTestCase):
             helium_mod.restore_helium_group(ctx)
 
         self.assertEqual(ctx.helium_restored_ids, [93])
-
-
-class TestHeliumBackgroundStart(HeliumTestCase):
-    def _ctx(self, node):
-        ctx = RestoreContext()
-        ctx.helium_saved_nodes.append(node)
-        ctx.helium_saved_index[id(node)] = 0
-        ctx.helium_restored_ids.append(None)
-        return ctx
-
-    def test_start_without_saved_nodes_does_nothing(self):
-        ctx = RestoreContext()
-        helium_mod.start_helium_restore(ctx)
-        self.assertIsNone(ctx.helium_thread)
-
-    def test_get_restored_id_joins_the_background_thread(self):
-        node = make_window("helium", name="tab a")
-        ctx = self._ctx(node)
-
-        def slow_group(context):
-            time.sleep(0.05)
-            context.helium_restore_started = True
-            context.helium_restored_ids[0] = 99
-
-        with unittest.mock.patch.object(helium_mod, "restore_helium_group", slow_group):
-            helium_mod.start_helium_restore(ctx)
-            self.assertIsNotNone(ctx.helium_thread)
-            self.assertEqual(helium_mod.get_helium_restored_id(node, ctx), 99)
-            self.assertFalse(ctx.helium_thread.is_alive())
 
 
 class TestHeliumResolve(HeliumTestCase):

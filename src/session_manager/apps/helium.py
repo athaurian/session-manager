@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import threading
 import time
 
 from ..config import (
@@ -360,38 +359,13 @@ def restore_helium_group(ctx: RestoreContext) -> None:
                 break
 
 
-def start_helium_restore(ctx: RestoreContext) -> None:
-    """Start the Helium group restore in the background.
-
-    The browser takes seconds to open its windows. Restoring the group
-    concurrently lets the rest of the session be placed while it loads. The
-    first Helium node joins the thread through get_helium_restored_id().
-
-    Args:
-        ctx: Restore context holding the saved Helium nodes.
-    """
-    if ctx.helium_thread is not None or ctx.helium_restore_started:
-        return
-    if not ctx.helium_saved_nodes:
-        return
-
-    def run() -> None:
-        """Restore the group and log any failures."""
-        try:
-            restore_helium_group(ctx)
-        except Exception:
-            log.exception("Helium restore failed")
-
-    thread = threading.Thread(target=run, name="helium-restore", daemon=True)
-    ctx.helium_thread = thread
-    thread.start()
-
-
 def get_helium_restored_id(node: dict, ctx: RestoreContext) -> int | None:
-    """Return the live window id assigned to a saved Helium node."""
-    if ctx.helium_thread is not None:
-        ctx.helium_thread.join()
-    elif not ctx.helium_restore_started:
+    """Return the live window id assigned to a saved Helium node.
+
+    The group is normally restored through materialization. A node that
+    bypassed it, such as one launched on demand, restores the group here.
+    """
+    if not ctx.helium_restore_started:
         restore_helium_group(ctx)
     idx = ctx.helium_saved_index.get(id(node))
     if idx is None:

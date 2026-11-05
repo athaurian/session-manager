@@ -115,8 +115,6 @@ class RestoreHarnessTestCase(unittest.TestCase):
         self._patches = [
             unittest.mock.patch.object(restore_mod, "cmd", self._record_cmd),
             unittest.mock.patch.object(restore_mod, "run_command", self._record_cmd),
-            # The geometry settle delay would otherwise slow every test down.
-            unittest.mock.patch.object(restore_mod, "sleep", lambda _seconds: None),
             unittest.mock.patch.object(restore_mod, "get_tree", self._fake_get_tree),
             unittest.mock.patch.object(
                 restore_mod, "launch_and_get_id", self._fake_launch

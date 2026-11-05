@@ -78,12 +78,6 @@ RESTORE_STAGING_WORKSPACE = "_session_restore"
 DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600
 
-# A floating window that has just started asks Sway for its own size, and
-# that request can land after the restore's resize and undo it. Apply the
-# geometry again after this delay, once the window has settled, so the
-# restored size sticks.
-FLOAT_GEOMETRY_RETRY_DELAY = 0.4
-
 
 def escape_cwd(cwd: str) -> str:
     """Escape a cwd for use as a snapshot or swap filename.

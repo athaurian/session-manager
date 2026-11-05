@@ -188,7 +188,9 @@ class TestHeliumGroup(MaterializeHarness):
         with unittest.mock.patch.object(
             restore_mod, "restore_helium_group", fake_group
         ):
-            restore_mod._start_helium_materialization(ctx)
+            done = restore_mod._start_helium_materialization(ctx)
+            self.assertIsNotNone(done)
+            done.wait()
             self.assertEqual(ctx.registry.resolve(nodes[0]), 11)
 
         self.assertEqual([ctx.registry.resolve(node) for node in nodes], [11, 12])
@@ -207,8 +209,8 @@ class TestHeliumGroup(MaterializeHarness):
         with unittest.mock.patch.object(
             restore_mod, "restore_helium_group", fake_group
         ):
-            restore_mod._start_helium_materialization(ctx)
-            restore_mod._start_helium_materialization(ctx)
+            self.assertIsNotNone(restore_mod._start_helium_materialization(ctx))
+            self.assertIsNone(restore_mod._start_helium_materialization(ctx))
             self.assertEqual(ctx.registry.resolve(node), 21)
 
         self.assertEqual(len(calls), 1)

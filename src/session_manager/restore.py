@@ -23,7 +23,6 @@ from .background import restore_background_apps
 from .config import (
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
-    FLOAT_GEOMETRY_RETRY_DELAY,
     RESTORE_STAGING_WORKSPACE,
     SCRATCH_RESTORE_WORKSPACE,
     SCRATCHPAD_WORKSPACE,
@@ -54,9 +53,6 @@ log = logging.getLogger("session_manager")
 # Log command failures but never abort the walk. Stale con_id and closed window
 # failures are expected during restore.
 cmd = run_command_logged
-
-# Patched in tests so the geometry settle delay does not slow the suite down.
-sleep = time.sleep
 
 _WORKSPACE_SAFE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
@@ -271,13 +267,18 @@ def _start_materialization(
 def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
     """Launch the windows in `nodes`, then wait before anything is placed.
 
-    Windows that were reused from the live tree need no launch. Waiting
-    matters: a window that maps while the walk is issuing `split` or
-    `layout` can steal focus and reshape the wrong container.
+    Windows that were reused from the live tree need no launch. The browser
+    group restores alongside the other launches, and placement still waits
+    for it: a window that maps while the walk is issuing `split` or `layout`
+    can steal focus and reshape the wrong container.
     """
     pending = [node for node in nodes if not ctx.registry.has(node)]
-    for event in _start_materialization(pending, ctx):
+    helium = _start_helium_materialization(ctx)
+    events = _start_materialization(pending, ctx)
+    for event in events:
         event.wait()
+    if helium is not None:
+        helium.wait()
 
 
 def _run_helium_unit(ctx: RestoreContext) -> None:
@@ -291,12 +292,18 @@ def _run_helium_unit(ctx: RestoreContext) -> None:
             ctx.registry.record(node, ctx.helium_restored_ids[idx])
 
 
-def _start_helium_materialization(ctx: RestoreContext) -> None:
-    """Start the browser group restore alongside the other launches."""
+def _start_helium_materialization(ctx: RestoreContext) -> threading.Event | None:
+    """Start the browser group restore alongside the other launches.
+
+    Returns the event that is set once the group has published its ids, or
+    None when there is no saved browser window.
+    """
     if ctx.helium_materialized or not ctx.helium_saved_nodes:
-        return
+        return None
     ctx.helium_materialized = True
-    ctx.registry.submit(list(ctx.helium_saved_nodes), partial(_run_helium_unit, ctx))
+    return ctx.registry.submit(
+        list(ctx.helium_saved_nodes), partial(_run_helium_unit, ctx)
+    )
 
 
 def _window_workspace_name(win_id: int) -> str | None:
@@ -399,7 +406,7 @@ def _park_in_scratchpad(win_id: int, node: dict, ctx: RestoreContext) -> None:
             # The window is not in the tree yet, or it has closed. There is
             # nothing to correct and nothing that can be verified.
             return
-        sleep(0.05)
+        time.sleep(0.05)
         cmd(f"[con_id={win_id}] move scratchpad")
     ctx.add_failure(f"{_failure_label(node)}: still visible after move scratchpad")
 
@@ -757,13 +764,9 @@ def _apply_geometry(win_id: int, rect: dict, workspace_name: str | None = None) 
         cmd(f"[con_id={win_id}] move position {x} {y}")
         return
 
-    # A newly started window can ask Sway for its own size after the resize
-    # and undo it. It may also lack a titlebar until it settles, so the
-    # decoration height cannot be measured yet. Apply the geometry again
-    # after the delay to cover both cases. i3 applies geometry directly and
-    # returns above without waiting.
-    _apply_sway_geometry(win_id, rect, workspace_name)
-    sleep(FLOAT_GEOMETRY_RETRY_DELAY)
+    # Windows are launched and mapped before the walk places them, and the
+    # app-matched waits hold the window until it settles, so the geometry
+    # can be applied once. i3 applies geometry directly and returns above.
     _apply_sway_geometry(win_id, rect, workspace_name)
 
 
@@ -939,16 +942,6 @@ def _restore_hidden_scratchpad(node: dict, ctx: RestoreContext) -> None:
 def _failure_label(node: dict) -> str:
     """Return a readable name for a window that failed to restore."""
     return str(node.get("name") or node_app_id(node) or node.get("type", "window"))
-
-
-def _contains_helium(node: dict) -> bool:
-    """Report whether a saved subtree holds a Helium window."""
-    if node.get("type") == "window" and node_app_id(node) == "helium":
-        return True
-    return any(
-        _contains_helium(child)
-        for child in node.get("nodes", []) + node.get("floating_nodes", [])
-    )
 
 
 def _record_failure(ctx: RestoreContext, node: dict, exc: Exception) -> None:
@@ -1249,14 +1242,9 @@ def _restore_session_locked(
             cmd(_workspace_cmd(RESTORE_STAGING_WORKSPACE))
         _materialize(visible_windows, ctx)
 
-        # Browser windows map on their own schedule, so they are arranged
-        # after every other workspace and only once the whole group exists.
-        plain = [ws for ws in workspaces if not _contains_helium(ws)]
-        browser = [ws for ws in workspaces if _contains_helium(ws)]
-        _arrange(plain)
-        if browser:
-            _start_helium_materialization(ctx)
-            _arrange(browser)
+        # Every window exists by now, so the workspaces are arranged in the
+        # order they were saved; no workspace has to wait for the browser.
+        _arrange(workspaces)
 
         if hidden_scratchpad and detect_backend() != "i3":
             # Stage geometry on a scratch workspace before parking the windows
@@ -1267,7 +1255,6 @@ def _restore_session_locked(
             # Hidden windows are launched just before they are parked, so they
             # are not left visible on a normal workspace while the rest of the
             # session is arranged.
-            _start_helium_materialization(ctx)
             for node in hidden_scratchpad:
                 try:
                     _restore_hidden_scratchpad(node, ctx)

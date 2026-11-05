@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import tempfile
-import time
 from pathlib import Path
 
 from .background import detect_background_apps
@@ -17,7 +16,7 @@ from .config import (
     STATE_DIR,
     STATE_FILE,
 )
-from .ipc import IpcError, close_connection, get_tree, node_app_id, walk_tree
+from .ipc import IpcError, close_connection, get_tree, walk_tree
 from .locking import operation_lock
 from .logging_setup import notify
 from .model import Snapshot
@@ -117,15 +116,6 @@ def save_session(*, notify_user: bool = True) -> None:
                     workspaces.append(cleaned)
 
             background_apps = detect_background_apps(cache, tree=tree)
-
-            # If helium windows are present, give it a moment to flush its
-            # Session/Tabs files so --restore-last-session will see
-            # both windows.
-            has_helium = any(
-                node_app_id(n) == "helium" for ws in workspaces for n in walk_tree(ws)
-            )
-            if has_helium:
-                time.sleep(0.8)
 
             payload = Snapshot(
                 workspaces=workspaces,

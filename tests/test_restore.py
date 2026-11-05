@@ -255,58 +255,9 @@ class TestApplyGeometry(RestoreHarnessTestCase):
         self._apply({"x": 243, "y": 197, "width": 800, "height": 600})
         moves = [i for i, c in enumerate(self.calls) if "move position" in c]
         resizes = [i for i, c in enumerate(self.calls) if "resize set" in c]
-        self.assertEqual(len(moves), 2)
-        self.assertEqual(len(resizes), 2)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(len(resizes), 1)
         self.assertLess(resizes[0], moves[0])
-        self.assertLess(resizes[1], moves[1])
-
-    def test_geometry_is_applied_again_after_the_window_settles(self):
-        """Sway lets a new window ask for its own size, and that request
-        lands after the first resize and undoes it. The geometry is applied
-        a second time so the restored size wins."""
-        self._apply({"x": 243, "y": 197, "width": 800, "height": 600})
-        resizes = [c for c in self.calls if "resize set" in c]
-        moves = [c for c in self.calls if "move position" in c]
-        self.assertEqual(
-            resizes[0], "[con_id=1000] resize set width 800 px height 600 px"
-        )
-        self.assertEqual(resizes[1], resizes[0])
-        self.assertEqual(moves[0], "[con_id=1000] move position 239 169")
-        self.assertEqual(moves[1], moves[0])
-
-    def test_retry_measures_the_titlebar_that_appeared_after_the_launch(self):
-        """A window that has just started has no titlebar yet, so the first
-        attempt cannot measure its height. The retry re-measures it."""
-        import unittest.mock
-
-        trees = [
-            self._tree(deco_height=0),
-            self._tree(deco_height=21),
-        ]
-        # Each geometry application reads the tree twice: once for the
-        # titlebar height and once for the workspace origin.
-        seen: list[int] = []
-
-        def fake_tree():
-            seen.append(1)
-            return trees[0] if len(seen) <= 2 else trees[1]
-
-        with unittest.mock.patch.object(self.restore_mod, "get_tree", fake_tree):
-            self.restore_mod._apply_geometry(
-                1000, {"x": 243, "y": 197, "width": 800, "height": 600}, "1"
-            )
-        resizes = [c for c in self.calls if "resize set" in c]
-        moves = [c for c in self.calls if "move position" in c]
-        # First attempt: no titlebar yet.
-        self.assertEqual(
-            resizes[0], "[con_id=1000] resize set width 800 px height 600 px"
-        )
-        # Retry: the titlebar is 21px, so it is added to the height and
-        # subtracted from the y position.
-        self.assertEqual(
-            resizes[1], "[con_id=1000] resize set width 800 px height 621 px"
-        )
-        self.assertEqual(moves[1], "[con_id=1000] move position 239 148")
 
     def test_missing_workspace_falls_back_to_saved_coords(self):
         import unittest.mock
@@ -411,7 +362,7 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
         switches = [c for c in self.calls if c.startswith("workspace ")]
         self.assertEqual(switches[-1], "workspace 1")
 
-    def test_helium_workspace_restores_last(self):
+    def test_workspaces_restore_in_saved_order(self):
         hel = make_window("helium", name="tab a")
         ws1 = make_workspace("1", nodes=[hel])
         ws2 = make_workspace("2", nodes=[make_window("kitty", cwd="/b")])
@@ -426,8 +377,7 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
             for c in self.calls
             if c.startswith("workspace ") and "_session_restore" not in c
         ]
-        self.assertEqual(switches[0], "workspace 2")
-        self.assertLess(switches.index("workspace 2"), switches.index("workspace 1"))
+        self.assertLess(switches.index("workspace 1"), switches.index("workspace 2"))
 
     def test_invalid_session_file_skips_restore(self):
         import tempfile

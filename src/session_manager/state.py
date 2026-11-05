@@ -45,4 +45,3 @@ class RestoreContext:
     helium_restored_ids: list[int | None] = field(default_factory=list)
     helium_restore_started: bool = False
     helium_materialized: bool = False
-    helium_thread: threading.Thread | None = None

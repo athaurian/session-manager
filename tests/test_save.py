@@ -181,12 +181,6 @@ class TestSaveSession(unittest.TestCase):
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         self.assertEqual(payload["version"], 3)
 
-    def test_helium_windows_wait_for_the_session_files(self):
-        self.tree["nodes"][0]["nodes"][0]["nodes"].append(make_window("helium"))
-        with unittest.mock.patch.object(save_mod.time, "sleep") as sleep:
-            self._save()
-        sleep.assert_called_once_with(0.8)
-
 
 class TestUnreachableCompositor(unittest.TestCase):
     """A dead IPC socket must not produce a traceback."""
