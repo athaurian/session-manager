@@ -94,7 +94,8 @@ def _handlers() -> tuple[dict[str, AppHandler], AppHandler]:
             "thunar": AppHandler(
                 launch=launch_thunar,
                 capture=capture_thunar,
-                pid_matched=True,
+                # Thunar is single-instance over D-Bus, so its window is found
+                # by app identity rather than by the launched pid.
             ),
             "mpv": AppHandler(
                 launch=launch_mpv,
