@@ -186,6 +186,18 @@ class TestSocketResolution(unittest.TestCase):
         ):
             self.assertEqual(ipc_mod.resolve_socket_path(), self.sway_sock)
 
+    def test_pinned_backend_ignores_the_other_compositor(self):
+        env = {"SWAYSOCK": self.sway_sock, "SESSION_MANAGER_BACKEND": "i3"}
+        with (
+            unittest.mock.patch.dict(os.environ, env, clear=True),
+            unittest.mock.patch.object(
+                ipc_mod,
+                "_socket_from_binary",
+                side_effect=lambda backend: self.sway_sock if backend == "sway" else "",
+            ),
+        ):
+            self.assertEqual(ipc_mod.resolve_socket_path(), "")
+
     def test_falls_back_to_get_socketpath(self):
         with (
             unittest.mock.patch.dict(

@@ -78,25 +78,31 @@ def resolve_socket_path() -> str:
 
     SESSION_MANAGER_SOCK is an explicit override. Otherwise the backend's
     environment variable is preferred, then the other compositor's variable,
-    then ``--get-socketpath`` from the matching binary. Candidates whose
-    socket file no longer exists are skipped, so a value left over from a
-    previous compositor run does not shadow the live socket.
+    then ``--get-socketpath`` from the matching binary. A pinned
+    ``SESSION_MANAGER_BACKEND`` restricts both the variables and the binary to
+    that backend, so an i3 session never connects to Sway or vice versa.
+    Candidates whose socket file no longer exists are skipped, so a value left
+    over from a previous compositor run does not shadow the live socket.
     """
     explicit = os.environ.get("SESSION_MANAGER_SOCK", "").strip()
     if explicit:
         return explicit
 
+    pinned = os.environ.get("SESSION_MANAGER_BACKEND", "").strip().lower()
     backend = detect_backend()
-    primary, secondary = (
-        ("I3SOCK", "SWAYSOCK") if backend == "i3" else ("SWAYSOCK", "I3SOCK")
-    )
+    other = "i3" if backend == "sway" else "sway"
+    primary = "I3SOCK" if backend == "i3" else "SWAYSOCK"
+    secondary = "SWAYSOCK" if backend == "i3" else "I3SOCK"
+    names = (primary,) if pinned in ("i3", "sway") else (primary, secondary)
+    binaries = (backend,) if pinned in ("i3", "sway") else (backend, other)
+
     candidates: list[str] = []
-    for name in (primary, secondary):
+    for name in names:
         value = os.environ.get(name, "").strip()
         if value:
             candidates.append(value)
 
-    for candidate in (backend, "i3" if backend == "sway" else "sway"):
+    for candidate in binaries:
         value = _socket_from_binary(candidate)
         if value:
             candidates.append(value)
