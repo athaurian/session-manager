@@ -153,7 +153,10 @@ class TestSocketResolution(unittest.TestCase):
         path = os.path.join(self.tmp.name, name)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(path)
-        sock.close()
+        # The socket has to stay live: a path with no listener is a stale
+        # one, and the resolver skips those.
+        sock.listen(8)
+        self.addCleanup(sock.close)
         return path
 
     def test_i3_socket_environment(self):
@@ -214,6 +217,28 @@ class TestSocketResolution(unittest.TestCase):
     def test_stale_socket_is_skipped(self):
         """A socket path left over from a previous run must not be used."""
         stale = os.path.join(self.tmp.name, "gone.sock")
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {"I3SOCK": stale, "SESSION_MANAGER_BACKEND": "i3"},
+                clear=True,
+            ),
+            unittest.mock.patch.object(
+                ipc_mod,
+                "_socket_from_binary",
+                side_effect=lambda backend: self.i3_sock if backend == "i3" else "",
+            ),
+        ):
+            self.assertEqual(ipc_mod.resolve_socket_path(), self.i3_sock)
+
+    def test_a_socket_file_without_a_listener_is_skipped(self):
+        """The file is left behind when the compositor dies; it is not live."""
+        import socket
+
+        stale = os.path.join(self.tmp.name, "stale.sock")
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(stale)
+        dead.close()
         with (
             unittest.mock.patch.dict(
                 os.environ,

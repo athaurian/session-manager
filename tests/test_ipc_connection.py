@@ -74,7 +74,7 @@ class TestConnectionFailures(unittest.TestCase):
     def test_command_timeout_closes_the_connection(self):
         conn = self._connect()
         self.server.accept()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(IpcError):
             conn.command("get_tree", timeout=0.2)
         # The socket is dropped so the next command starts fresh.
         self.assertIsNone(conn._sock)
@@ -131,7 +131,7 @@ class TestConnectionFailures(unittest.TestCase):
         """The connection is rebuilt, so no stale reply can be returned."""
         conn = self._connect()
         self.server.accept()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(IpcError):
             conn.command("first", timeout=0.2)
         self.assertIsNone(conn._sock)
 
@@ -178,6 +178,32 @@ class TestRequests(unittest.TestCase):
         results = [{"success": True}]
         with unittest.mock.patch.object(conn, "command", return_value=results):
             self.assertEqual(conn.command_checked("split h"), results)
+
+    def test_a_non_list_reply_is_refused(self):
+        """An empty list would look like a command that did nothing."""
+        conn = self._connect()
+        self.server.send_message(0, json.dumps({"success": True}))
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_malformed_reply_is_an_ipc_error(self):
+        conn = self._connect()
+        self.server.send_message(0, "{not json")
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_reply_that_is_not_utf8_is_an_ipc_error(self):
+        conn = self._connect()
+        body = b"\xff\xfe"
+        self.server.send(HEADER.pack(MAGIC, len(body), 0) + body)
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_malformed_tree_reply_is_an_ipc_error(self):
+        conn = self._connect()
+        self.server.send_message(MSG_GET_TREE, "[1, 2]")
+        with self.assertRaises(IpcError):
+            conn.get_tree()
 
 
 class TestWindowEventWatcher(unittest.TestCase):

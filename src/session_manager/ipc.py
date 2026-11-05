@@ -38,6 +38,9 @@ MSG_GET_TREE = 4
 EVENT_BIT = 1 << 31
 EVENT_WINDOW = 3
 
+# How long a socket probe may wait before the path is taken for dead.
+_SOCKET_PROBE_TIMEOUT = 0.25
+
 
 class IpcError(OSError):
     """Error raised when the compositor's IPC socket cannot be reached or used.
@@ -66,11 +69,26 @@ def _socket_from_binary(backend: str) -> str:
 
 
 def _socket_exists(path: str) -> bool:
-    """Report whether a path is a socket file that still exists."""
+    """Report whether a path is a live compositor socket.
+
+    A socket file left behind by a compositor that has since died still
+    looks like a socket, so the path is probed with a connection. A stale
+    path would otherwise shadow the live one.
+    """
     try:
-        return stat.S_ISSOCK(os.stat(path).st_mode)
+        if not stat.S_ISSOCK(os.stat(path).st_mode):
+            return False
     except OSError:
         return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(_SOCKET_PROBE_TIMEOUT)
+    try:
+        probe.connect(path)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
 
 
 def resolve_socket_path() -> str:
@@ -226,11 +244,39 @@ class IpcConnection:
     # -- wire ----------------------------------------------------------
 
     def _send(self, msg_type: int, payload: str | bytes = b"") -> None:
-        """Send one framed IPC message."""
-        if self._sock is None:
+        """Send one framed IPC message.
+
+        The write has a deadline of its own: a compositor that stopped
+        reading must not block the manager forever.
+        """
+        s = self._sock
+        if s is None:
             raise IpcError("socket not connected")
         body = payload.encode("utf-8") if isinstance(payload, str) else payload
-        self._sock.sendall(HEADER.pack(MAGIC, len(body), msg_type) + body)
+        data = HEADER.pack(MAGIC, len(body), msg_type) + body
+        # A read may be told to wait forever, but a write never may: a
+        # compositor that stopped reading must not block the manager.
+        write_timeout = self.request_timeout
+        if write_timeout is None:
+            write_timeout = IPC_REQUEST_TIMEOUT
+        deadline = time.monotonic() + write_timeout
+        while data:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise IpcError("IPC write timed out")
+            try:
+                _, writable, _ = select.select([], [s], [], timeout)
+            except OSError as exc:
+                raise IpcError("socket closed during select") from exc
+            if not writable:
+                raise IpcError("IPC write timed out")
+            try:
+                sent = s.send(data)
+            except OSError as exc:
+                raise IpcError("socket closed during send") from exc
+            if sent <= 0:
+                raise IpcError("socket closed by Sway")
+            data = data[sent:]
 
     def _read_exact(self, n: int, deadline: float | None) -> bytes:
         """Read exactly n bytes, honouring an optional deadline."""
@@ -287,7 +333,14 @@ class IpcConnection:
             body = self._read_exact(length, body_deadline)
         except TimeoutError as exc:
             raise IpcError("IPC read timed out mid-message") from exc
-        return msg_type, json.loads(body.decode("utf-8"))
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise IpcError("IPC reply was not valid UTF-8") from exc
+        try:
+            return msg_type, json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise IpcError("IPC reply was not valid JSON") from exc
 
     # -- requests ------------------------------------------------------
 
@@ -301,14 +354,21 @@ class IpcConnection:
                 msg_type, payload = self._recv(
                     self.request_timeout if timeout is None else timeout
                 )
-            except (TimeoutError, IpcError, OSError):
+            except TimeoutError as exc:
+                # The reply may be half-read, so the stream is no longer
+                # usable. Drop it and let the next call reconnect.
+                self.close()
+                raise IpcError(f"IPC request timed out: {exc}") from exc
+            except (IpcError, OSError):
                 # The reply may be half-read, so the stream is no longer
                 # usable. Drop it and let the next call reconnect.
                 self.close()
                 raise
         if msg_type != MSG_RUN_COMMAND:
             raise IpcError(f"expected RUN_COMMAND reply, got {msg_type}")
-        return payload if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            raise IpcError(f"RUN_COMMAND returned {type(payload).__name__}")
+        return payload
 
     def command_checked(self, cmd: str, *, timeout: float | None = None) -> list[dict]:
         """Run a command and raise when the compositor reports failure."""
@@ -326,7 +386,10 @@ class IpcConnection:
                 msg_type, payload = self._recv(
                     self.request_timeout if timeout is None else timeout
                 )
-            except (TimeoutError, IpcError, OSError):
+            except TimeoutError as exc:
+                self.close()
+                raise IpcError(f"IPC request timed out: {exc}") from exc
+            except (IpcError, OSError):
                 self.close()
                 raise
         if msg_type != MSG_GET_TREE:
@@ -345,6 +408,9 @@ class WindowEventWatcher:
             with self._conn._lock:
                 self._conn._send(MSG_SUBSCRIBE, json.dumps(["window"]))
                 msg_type, reply = self._conn._recv(timeout=IPC_SUBSCRIBE_TIMEOUT)
+        except TimeoutError as exc:
+            self._conn.close()
+            raise IpcError("timed out subscribing to window events") from exc
         except Exception:
             self._conn.close()
             raise
