@@ -54,6 +54,21 @@ class TestSnapshotRepair(unittest.TestCase):
         self.assertEqual([ws["name"] for ws in snapshot.workspaces], ["1"])
         self.assertTrue(snapshot.issues)
 
+    def test_bad_child_is_dropped_but_its_sibling_survives(self):
+        """Repair is per node, not per workspace or per session."""
+        good = make_window("kitty")
+        bad = {"type": "not-a-node"}
+        ws = make_workspace("1", nodes=[good, bad])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertEqual(len(snapshot.workspaces), 1)
+        self.assertEqual(
+            [node.get("app_id") for node in snapshot.workspaces[0]["nodes"]],
+            ["kitty"],
+        )
+        self.assertTrue(
+            any("workspaces[0].nodes[1]" in issue for issue in snapshot.issues)
+        )
+
     def test_hidden_scratchpad_container_is_accepted(self):
         group = make_con(nodes=[make_window("kitty"), make_window("kitty")])
         snapshot = Snapshot.from_payload(

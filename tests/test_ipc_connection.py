@@ -19,6 +19,7 @@ from session_manager.ipc import (
     HEADER,
     MAGIC,
     MSG_GET_TREE,
+    MSG_RUN_COMMAND,
     MSG_SUBSCRIBE,
     IpcConnection,
     IpcError,
@@ -112,19 +113,22 @@ class TestConnectionFailures(unittest.TestCase):
             IpcConnection(sock_path=os.path.join(self.tmp.name, "gone")).connect()
 
     def test_shared_connection_is_rebuilt_after_a_failure(self):
-        conn = self._connect()
-        conn.close()
+        with unittest.mock.patch.object(
+            ipc_mod, "resolve_socket_path", return_value=self.server.path
+        ):
+            first = ipc_mod.connection()
+            self.server.accept()
+            with self.assertRaises(IpcError):
+                first.command("first", timeout=0.05)
+            self.assertIsNone(first._sock)
 
-        class FakeConnection:
-            def connect(self):
-                return self
-
-            def close(self):
-                pass
-
-        with unittest.mock.patch.object(ipc_mod, "IpcConnection", FakeConnection):
-            rebuilt = ipc_mod.connection()
-        self.assertIsInstance(rebuilt, FakeConnection)
+            # The next caller must get a fresh connection that reads the
+            # reply belonging to its own command.
+            second = ipc_mod.connection()
+            self.assertIsNot(second, first)
+            self.server.accept()
+            self.server.send_message(MSG_RUN_COMMAND, json.dumps([{"success": True}]))
+            self.assertEqual(second.command("second"), [{"success": True}])
         ipc_mod.close_connection()
 
     def test_command_after_a_timeout_reads_the_new_reply(self):
@@ -134,6 +138,11 @@ class TestConnectionFailures(unittest.TestCase):
         with self.assertRaises(IpcError):
             conn.command("first", timeout=0.2)
         self.assertIsNone(conn._sock)
+
+        conn.connect()
+        self.server.accept()
+        self.server.send_message(MSG_RUN_COMMAND, json.dumps([{"success": True}]))
+        self.assertEqual(conn.command("second"), [{"success": True}])
 
 
 class TestRequests(unittest.TestCase):
