@@ -162,9 +162,36 @@ class TestResolutionFromLibrary(CalibreTestCase):
             str(book.resolve()),
         )
 
+    def test_adds_the_extension_the_database_omits(self):
+        """Calibre stores `data.name` without the file's extension."""
+        self.make_library([(1, "Dune", "Frank Herbert/Dune (1)", "EPUB", "Dune")])
+        book = self.add_book_file("Frank Herbert/Dune (1)", "Dune.epub")
+        self.assertEqual(
+            calibre_mod._resolve_calibre_document_from_library("Dune", "EPUB"),
+            str(book.resolve()),
+        )
+
+    def test_adds_the_kepub_extension(self):
+        self.make_library([(1, "Dune", "Frank Herbert/Dune (1)", "KEPUB", "Dune")])
+        book = self.add_book_file("Frank Herbert/Dune (1)", "Dune.kepub.epub")
+        self.assertEqual(
+            calibre_mod._resolve_calibre_document_from_library("Dune", "EPUB"),
+            str(book.resolve()),
+        )
+
     def test_finds_a_filename_with_underscores(self):
         self.make_library(
             [(1, "Dune", "Frank Herbert/Dune (1)", "EPUB", "Dune Messiah.epub")]
+        )
+        book = self.add_book_file("Frank Herbert/Dune (1)", "Dune_Messiah.epub")
+        self.assertEqual(
+            calibre_mod._resolve_calibre_document_from_library("Dune", "EPUB"),
+            str(book.resolve()),
+        )
+
+    def test_finds_an_underscored_name_without_the_extension(self):
+        self.make_library(
+            [(1, "Dune", "Frank Herbert/Dune (1)", "EPUB", "Dune Messiah")]
         )
         book = self.add_book_file("Frank Herbert/Dune (1)", "Dune_Messiah.epub")
         self.assertEqual(
