@@ -53,3 +53,8 @@ class RestoreContext:
     helium_restored_ids: list[int | None] = field(default_factory=list)
     helium_restore_started: bool = False
     helium_materialized: bool = False
+
+    # Whether the browser may replay its own last session. A restore that
+    # covers only one workspace must not, because that would reopen the
+    # browser windows saved on every other workspace.
+    helium_restore_last_session: bool = True

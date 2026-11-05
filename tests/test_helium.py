@@ -233,6 +233,45 @@ class TestHeliumEarlyReuse(HeliumTestCase):
         self.assertEqual(ctx.helium_restored_ids, [93])
 
 
+class TestHeliumScopedRestore(HeliumTestCase):
+    """A scoped restore opens one window per saved window, not the session."""
+
+    def _run_scoped(self, saved_nodes):
+        ctx = RestoreContext()
+        ctx.helium_restore_last_session = False
+        for node in saved_nodes:
+            ctx.helium_saved_nodes.append(node)
+            ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
+            ctx.helium_restored_ids.append(None)
+        helium_mod.restore_helium_group(ctx)
+        return ctx
+
+    def test_does_not_replay_the_browser_session(self):
+        FakePopen.on_launch = lambda: self.tree_windows.append(helium_node(81, ""))
+        self.watcher_events = [ev("new", 81, name="")]
+        self._run_scoped([make_window("helium", name="Tab A")])
+        commands = [inst.args[0] for inst in FakePopen.instances]
+        self.assertEqual(commands, [["helium-browser", "--new-window", "about:blank"]])
+
+    def test_opens_one_window_per_saved_window(self):
+        windows = [helium_node(82, ""), helium_node(83, "")]
+        FakePopen.on_launch = lambda: self.tree_windows.append(windows.pop(0))
+        self.watcher_events = [ev("new", 82, name=""), ev("new", 83, name="")]
+        saved = [
+            make_window("helium", name="Tab A"),
+            make_window("helium", name="Tab B"),
+        ]
+        ctx = self._run_scoped(saved)
+        self.assertEqual(len(FakePopen.instances), 2)
+        self.assertEqual(ctx.helium_restored_ids, [82, 83])
+
+    def test_reuses_a_live_window_with_a_matching_title(self):
+        self.tree_windows = [helium_node(84, "Tab A")]
+        ctx = self._run_scoped([make_window("helium", name="Tab A")])
+        self.assertEqual(ctx.helium_restored_ids, [84])
+        self.assertEqual(len(FakePopen.instances), 0)
+
+
 class TestHeliumResolve(HeliumTestCase):
     def test_get_restored_id_uses_saved_index(self):
         node = make_window("helium", name="Tab A")

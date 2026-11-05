@@ -185,11 +185,15 @@ class TestRestoreFloating(RestoreHarnessTestCase):
 
     def test_fullscreen_floating_window(self):
         self._floating(make_window("kitty", fullscreen_mode=1))
-        self.assertCommand("fullscreen")
+        self.assertCommand("fullscreen enable")
+
+    def test_global_fullscreen_floating_window(self):
+        self._floating(make_window("kitty", fullscreen_mode=2))
+        self.assertCommand("fullscreen enable global")
 
     def test_non_fullscreen_floating_window(self):
         self._floating(make_window("kitty", fullscreen_mode=0))
-        self.assertNotIn("fullscreen", " ".join(self.calls))
+        self.assertCommand("fullscreen disable")
 
     def test_marks_applied_to_kitty_drop_floating(self):
         self._floating(make_window("kitty_drop", marks=["d"]))
@@ -415,6 +419,158 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
                 for p in extra:
                     p.stop()
         self.assertEqual(self.calls, [])
+
+
+class TestWorkspaceFilter(RestoreHarnessTestCase):
+    """A filtered restore covers one workspace and nothing else."""
+
+    def _run_locked(self, payload, workspace_filter):
+        """Runs _restore_session_locked with a workspace filter."""
+        import json
+        import tempfile
+        import unittest.mock
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        background_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "sway_session.json"
+            state_file.write_text(json.dumps(payload), encoding="utf-8")
+            patches = [
+                unittest.mock.patch.object(self.restore_mod, "STATE_FILE", state_file),
+                unittest.mock.patch.object(
+                    self.restore_mod, "operation_lock", lambda _dir: nullcontext()
+                ),
+                unittest.mock.patch.object(self.restore_mod, "close_connection"),
+                unittest.mock.patch.object(self.restore_mod, "ProcCache"),
+                unittest.mock.patch.object(
+                    self.restore_mod,
+                    "restore_background_apps",
+                    lambda apps=None, **_kw: background_calls.append(apps),
+                ),
+            ]
+            for p in patches:
+                p.start()
+            try:
+                self.restore_mod._restore_session_locked(
+                    notify_user=False, workspace_filter=workspace_filter
+                )
+            finally:
+                for p in patches:
+                    p.stop()
+        return background_calls
+
+    def _payload(self):
+        ws1 = make_workspace("1", nodes=[make_window("kitty", cwd="/a")])
+        ws3 = make_workspace("3", nodes=[make_window("kitty", cwd="/b")])
+        return {
+            "workspaces": [ws1, ws3],
+            "hidden_scratchpad": [make_window("kitty", cwd="/c")],
+            "background_apps": [{"app_id": "vesktop"}],
+            "focused_workspace": "1",
+        }
+
+    def test_background_apps_are_not_restored(self):
+        """A filtered restore leaves the background apps alone."""
+        calls = self._run_locked(self._payload(), "3")
+        self.assertEqual(calls, [[]])
+
+    def test_only_the_filtered_workspace_is_arranged(self):
+        self._run_locked(self._payload(), "3")
+        switches = [c for c in self.calls if c.startswith("workspace ")]
+        self.assertIn("workspace 3", switches)
+        self.assertNotIn("workspace 1", switches)
+
+    def test_scratchpad_is_not_restored(self):
+        self._run_locked(self._payload(), "3")
+        self.assertFalse(any("scratchpad" in c for c in self.calls))
+
+    def test_restore_finishes_on_the_filtered_workspace(self):
+        """The saved focus may name another workspace; the filter wins."""
+        self._run_locked(self._payload(), "3")
+        switches = [c for c in self.calls if c.startswith("workspace ")]
+        self.assertEqual(switches[-1], "workspace 3")
+
+    def test_unknown_workspace_restores_nothing(self):
+        calls = self._run_locked(self._payload(), "9")
+        self.assertEqual(calls, [])
+        self.assertEqual(self.calls, [])
+
+
+class TestRestoreReporting(RestoreHarnessTestCase):
+    """The restore summary reports both kinds of loss."""
+
+    def _run_locked(self, payload):
+        """Runs _restore_session_locked and returns the notifications."""
+        import json
+        import tempfile
+        import unittest.mock
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        notifications: list[str] = []
+
+        def fake_launch(node, claimed_ids):
+            if node.get("app_id") == "broken-app":
+                raise OSError("cannot start")
+            if node.get("app_id") == "gone-app":
+                return None
+            return next(self._id_iter)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "sway_session.json"
+            state_file.write_text(json.dumps(payload), encoding="utf-8")
+            patches = [
+                unittest.mock.patch.object(self.restore_mod, "STATE_FILE", state_file),
+                unittest.mock.patch.object(
+                    self.restore_mod, "operation_lock", lambda _dir: nullcontext()
+                ),
+                unittest.mock.patch.object(self.restore_mod, "restore_background_apps"),
+                unittest.mock.patch.object(self.restore_mod, "close_connection"),
+                unittest.mock.patch.object(self.restore_mod, "ProcCache"),
+                unittest.mock.patch.object(
+                    self.restore_mod, "launch_and_get_id", fake_launch
+                ),
+                unittest.mock.patch.object(
+                    self.restore_mod,
+                    "notify",
+                    lambda msg, **_kw: notifications.append(msg),
+                ),
+            ]
+            for p in patches:
+                p.start()
+            try:
+                self.restore_mod._restore_session_locked(notify_user=True)
+            finally:
+                for p in patches:
+                    p.stop()
+        return notifications
+
+    def _payload(self):
+        ws = make_workspace(
+            "1",
+            nodes=[
+                make_window("gone-app", name="gone window"),
+                make_window("broken-app", name="broken window"),
+            ],
+        )
+        return {"workspaces": [ws], "hidden_scratchpad": [], "background_apps": []}
+
+    def test_missing_windows_are_reported_next_to_partial_failures(self):
+        """A partial failure must not hide the windows that never came back."""
+        notifications = self._run_locked(self._payload())
+        summary = notifications[-1]
+        self.assertIn("Partial failures: 1", summary)
+        self.assertIn("2 window(s) did not come back", summary)
+
+    def test_a_clean_restore_reports_nothing(self):
+        payload = {
+            "workspaces": [make_workspace("1")],
+            "hidden_scratchpad": [],
+            "background_apps": [],
+        }
+        notifications = self._run_locked(payload)
+        self.assertIn("you can safely move now", notifications[-1])
 
 
 class TestBackgroundRestoreOrder(RestoreHarnessTestCase):

@@ -5,13 +5,15 @@ come out as a plain message and a non-zero exit code, not a traceback.
 """
 
 import io
+import json
 import tempfile
 import unittest
 import unittest.mock
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import session_manager.restore as restore_mod
+import session_manager.save as save_mod
 from session_manager.__main__ import main
 from session_manager.ipc import IpcError
 from session_manager.restore import restore_session
@@ -65,6 +67,156 @@ class TestUnreachableCompositor(unittest.TestCase):
             self.assertRaises(ValueError),
         ):
             self._run("save")
+
+
+class TestExitCodes(unittest.TestCase):
+    """The exit code follows the result of the real command functions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_dir = Path(self.tmp.name) / "state"
+        self.state_dir.mkdir()
+        self.state_file = self.state_dir / "session.json"
+
+    def _run(self, action):
+        """Run the CLI and return (exit code, stdout, stderr)."""
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        code = 0
+        with (
+            unittest.mock.patch("sys.argv", ["session_manager", action]),
+            redirect_stderr(stderr),
+            redirect_stdout(stdout),
+        ):
+            try:
+                main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _save_patches(self, *extra):
+        """Patch the save path so it only touches a temporary state dir."""
+        return [
+            unittest.mock.patch.object(save_mod, "STATE_DIR", self.state_dir),
+            unittest.mock.patch.object(save_mod, "STATE_FILE", self.state_file),
+            unittest.mock.patch.object(
+                save_mod, "NVIM_SESSION_DIR", self.state_dir / "nvim"
+            ),
+            unittest.mock.patch.object(
+                save_mod,
+                "BACKGROUND_APPS_FILE",
+                self.state_dir / "session_background_apps.json",
+            ),
+            *extra,
+        ]
+
+    def test_save_exits_one_when_the_compositor_is_unreachable(self):
+        patches = self._save_patches(
+            unittest.mock.patch.object(
+                save_mod,
+                "get_tree",
+                side_effect=IpcError("cannot connect to /run/i3.sock: no such file"),
+            )
+        )
+        for p in patches:
+            p.start()
+        try:
+            code, _stdout, stderr = self._run("save")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_save_exits_zero_when_the_snapshot_is_written(self):
+        patches = self._save_patches(
+            unittest.mock.patch.object(
+                save_mod, "get_tree", return_value={"nodes": [], "floating_nodes": []}
+            ),
+            unittest.mock.patch.object(
+                save_mod, "detect_background_apps", return_value=[]
+            ),
+        )
+        for p in patches:
+            p.start()
+        try:
+            code, _stdout, _stderr = self._run("save")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(code, 0)
+        self.assertTrue(self.state_file.exists())
+
+    def test_diff_exits_one_when_the_live_tree_is_unreadable(self):
+        self.state_file.write_text(json.dumps({"workspaces": []}), encoding="utf-8")
+        with (
+            unittest.mock.patch.object(restore_mod, "STATE_FILE", self.state_file),
+            unittest.mock.patch.object(
+                restore_mod,
+                "get_tree",
+                side_effect=IpcError("cannot connect to /run/i3.sock: no such file"),
+            ),
+        ):
+            code, stdout, _stderr = self._run("diff")
+        self.assertEqual(code, 1)
+        self.assertIn("Cannot read live tree", stdout)
+
+    def test_diff_exits_one_when_the_saved_session_is_unreadable(self):
+        self.state_file.write_text("{ not valid json", encoding="utf-8")
+        with (
+            unittest.mock.patch.object(restore_mod, "STATE_FILE", self.state_file),
+            unittest.mock.patch.object(
+                restore_mod,
+                "get_tree",
+                return_value={"nodes": [], "floating_nodes": []},
+            ),
+        ):
+            code, stdout, _stderr = self._run("diff")
+        self.assertEqual(code, 1)
+        self.assertIn("Saved session unreadable", stdout)
+
+    def test_diff_exits_zero_when_both_sides_are_readable(self):
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "workspaces": [
+                        {
+                            "type": "workspace",
+                            "name": "1",
+                            "layout": "splith",
+                            "nodes": [],
+                            "floating_nodes": [],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            unittest.mock.patch.object(restore_mod, "STATE_FILE", self.state_file),
+            unittest.mock.patch.object(
+                restore_mod,
+                "get_tree",
+                return_value={"nodes": [], "floating_nodes": []},
+            ),
+        ):
+            code, stdout, _stderr = self._run("diff")
+        self.assertEqual(code, 0)
+        self.assertIn("Live vs Saved diff", stdout)
+
+    def test_a_timeout_does_not_produce_a_traceback(self):
+        with (
+            unittest.mock.patch.object(restore_mod, "apply_compositor_env"),
+            unittest.mock.patch.object(restore_mod, "notify"),
+            unittest.mock.patch.object(
+                restore_mod, "get_tree", side_effect=TimeoutError("IPC read timeout")
+            ),
+        ):
+            code, _stdout, stderr = self._run("restore")
+        self.assertEqual(code, 1)
+        self.assertIn("Cannot reach the window manager", stderr)
+        self.assertNotIn("Traceback", stderr)
 
 
 class TestRestoreFailsFast(unittest.TestCase):

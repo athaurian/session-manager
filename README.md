@@ -87,6 +87,11 @@ To check whether there is anything to restore without changing the desktop:
 | `--quiet`       | `save`, `restore` | Suppresses desktop notifications.                                                                              |
 | `--workspace N` | `restore`         | Restores only the workspace whose name matches `N` exactly. The scratchpad and background apps are left alone. |
 
+A filtered restore does not replay the browser's own session, because that
+session holds the windows saved on every other workspace. The browser windows
+of the selected workspace come back blank instead, because the compositor does
+not expose their URLs.
+
 ### State files
 
 - Sway: `~/.local/state/sway_session.json`
@@ -145,6 +150,9 @@ i3 and is not supported.
   intentionally not saved.
 
 ## Development
+
+The restore design and its invariants are documented in
+[`docs/restore-design.md`](docs/restore-design.md).
 
 The `Makefile` provides these targets:
 

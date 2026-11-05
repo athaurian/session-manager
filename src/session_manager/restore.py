@@ -973,9 +973,17 @@ def _apply_marks(win_id: int, marks: list[str]) -> None:
 
 
 def _apply_fullscreen(win_id: int, fullscreen_mode: int) -> None:
-    """Apply saved fullscreen state to a window."""
-    if fullscreen_mode == 1:
-        cmd(f"[con_id={win_id}] fullscreen")
+    """Apply saved fullscreen state to a window.
+
+    Use the explicit enable/disable forms: the bare command toggles, so a
+    rerun over an already-fullscreen window would leave it in the wrong state.
+    """
+    if fullscreen_mode == 2:
+        cmd(f"[con_id={win_id}] fullscreen enable global")
+    elif fullscreen_mode == 1:
+        cmd(f"[con_id={win_id}] fullscreen enable")
+    else:
+        cmd(f"[con_id={win_id}] fullscreen disable")
 
 
 def _apply_border(win_id: int, border: str) -> None:
@@ -1246,21 +1254,26 @@ def restore_session(
         )
 
 
-def diff_sessions() -> None:
-    """Show a plain-English diff of the live and saved sessions."""
+def diff_sessions() -> bool:
+    """Show a plain-English diff of the live and saved sessions.
+
+    Returns:
+        True when the diff was printed, False when the saved session or the
+        live tree could not be read.
+    """
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             payload = json.load(f)
         saved_ws, saved_hidden, saved_bg, _ = _normalise_restore_payload(payload)
     except (OSError, json.JSONDecodeError, StateValidationError) as exc:
         print(f"Saved session unreadable: {exc}")
-        return
+        return False
 
     try:
         live_tree = get_tree()
     except OSError as exc:
         print(f"Cannot read live tree: {exc}")
-        return
+        return False
     finally:
         try:
             close_connection()
@@ -1340,6 +1353,7 @@ def diff_sessions() -> None:
 
     if not saved_ws and not saved_hidden:
         print("  Saved session is empty")
+    return True
 
 
 def _restore_session_locked(
@@ -1374,7 +1388,13 @@ def _restore_session_locked(
                 )
                 return
             hidden_scratchpad = []
-            background_apps = None
+            # A filtered restore covers one workspace only. The background
+            # apps belong to the whole session, so they are left alone:
+            # an empty list keeps the sidecar fallback from launching them.
+            background_apps = []
+            # The saved focus may name a workspace outside the filter, so
+            # the restore finishes on the workspace it actually restored.
+            focused_workspace = workspace_filter
             log.info(
                 "Restoring only workspace %s (%d/%d)",
                 workspace_filter,
@@ -1392,6 +1412,10 @@ def _restore_session_locked(
         return
 
     ctx = RestoreContext()
+    # A filtered restore covers one workspace, so the browser must not
+    # replay its whole session: that would reopen the windows saved on
+    # every other workspace.
+    ctx.helium_restore_last_session = workspace_filter is None
     partial_failures: list[str] = []
 
     try:
@@ -1485,20 +1509,22 @@ def _restore_session_locked(
         close_connection()
 
     message = "<b>session restored successfully.</b>"
-    if partial_failures:
-        _notify(
-            f"{message} Partial failures: {len(partial_failures)}. See logs.",
-            urgency="normal",
-        )
-        log.warning("Partial restore failures: %s", ", ".join(partial_failures))
-    elif ctx.missing:
-        _notify(
-            f"{message} {len(ctx.missing)} window(s) did not come back. See logs.",
-            urgency="normal",
-        )
-        log.warning("Windows not restored: %s", ", ".join(ctx.missing))
+    if partial_failures or ctx.missing:
+        # Both kinds of loss are reported: a partial failure says a window
+        # came back in the wrong state, a missing one says it never came
+        # back at all. Hiding either hides the reason the session is short.
+        summary = []
+        if partial_failures:
+            summary.append(f"Partial failures: {len(partial_failures)}")
+        if ctx.missing:
+            summary.append(f"{len(ctx.missing)} window(s) did not come back")
+        _notify(f"{message} {'; '.join(summary)}. See logs.", urgency="normal")
     else:
         _notify(f"{message} you can safely move now.")
+    if partial_failures:
+        log.warning("Partial restore failures: %s", ", ".join(partial_failures))
+    if ctx.missing:
+        log.warning("Windows not restored: %s", ", ".join(ctx.missing))
     log.info("Restore complete.")
 
     # Daemon checks and background launches are best effort. Running them
