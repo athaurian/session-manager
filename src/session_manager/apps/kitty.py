@@ -146,9 +146,10 @@ def build_kitty_nvim_args(node: dict) -> list[str]:
     was_ssh = node.get("was_ssh")
     if was_ssh and isinstance(was_ssh, str):
         # Do not auto-run ssh, because it needs a password. Leave a reconnect
-        # hint for the user instead.
-        safe = shlex.quote(was_ssh)
-        return ["bash", "-ic", f"echo 'was: {safe} — press Up to reconnect'; exec bash"]
+        # hint for the user instead. Quote the whole message: quoting only the
+        # command would leave shell metacharacters outside the echo argument.
+        message = f"was: {was_ssh} — press Up to reconnect"
+        return ["bash", "-ic", f"echo {shlex.quote(message)}; exec bash"]
 
     nvim_type = node.get("nvim_type", "none")
     snapshot_path_str = node.get("nvim_snapshot", "")

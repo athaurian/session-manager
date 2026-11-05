@@ -1,6 +1,7 @@
 """Tests for the kitty terminal command builder and launcher."""
 
 import os
+import subprocess
 import tempfile
 import unittest
 import unittest.mock
@@ -60,6 +61,21 @@ class BuildKittyCommandTests(unittest.TestCase):
     def test_dashboard_opens_nvim(self):
         node = {"cwd": "/work", "name": "user@host:/work", "nvim_type": "dashboard"}
         self.assertEqual(kitty.build_kitty_command(node)[-1], "nvim")
+
+    def test_ssh_hint_keeps_metacharacters_inside_the_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "executed"
+            was_ssh = f"ssh host x; touch {marker}"
+            cmd = kitty.build_kitty_nvim_args({"cwd": "/work", "was_ssh": was_ssh})
+            script = cmd[2].removesuffix("; exec bash")
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertFalse(marker.exists())
+        self.assertIn(was_ssh, result.stdout)
 
     def test_session_restore_sources_the_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
