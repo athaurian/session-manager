@@ -112,7 +112,7 @@ class TestSaveSession(unittest.TestCase):
             ),
         ):
             pc_cls.snapshot.return_value = self._fake_snapshot()
-            save_mod.save_session(notify_user=False)
+            return save_mod.save_session(notify_user=False)
 
     def _backup(self, suffix):
         return self.state_file.with_name(f"{self.state_file.name}.{suffix}")
@@ -193,6 +193,15 @@ class TestSaveSession(unittest.TestCase):
             self._save()
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         self.assertEqual(payload["version"], 3)
+
+    def test_failed_write_leaves_the_previous_state_in_place(self):
+        self.state_file.write_text("current", encoding="utf-8")
+        with unittest.mock.patch.object(
+            save_mod.os, "replace", side_effect=OSError("disk full")
+        ):
+            saved = self._save()
+        self.assertFalse(saved)
+        self.assertEqual(self.state_file.read_text(encoding="utf-8"), "current")
 
 
 class TestUnreachableCompositor(unittest.TestCase):

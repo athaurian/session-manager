@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -63,8 +64,8 @@ def _flatten_windows(node: dict) -> list[dict]:
     return windows
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    """Write content to a temporary file, then replace the target atomically."""
+def _write_temp(path: Path, content: str) -> Path:
+    """Write content beside `path` and return the temporary file."""
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -75,20 +76,73 @@ def _atomic_write(path: Path, content: str) -> None:
         f.write(content)
         f.flush()
         os.fsync(f.fileno())
-        tmp_path = f.name
-    os.replace(tmp_path, path)
+        return Path(f.name)
 
 
-def save_session(*, notify_user: bool = True) -> None:
+def _fsync_dir(path: Path) -> None:
+    """Flush a directory entry so a replace survives a crash."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to a temporary file, then replace the target atomically."""
+    tmp_path = _write_temp(path, content)
+    try:
+        os.replace(tmp_path, path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    _fsync_dir(path.parent)
+
+
+def _rotate_backups() -> str:
+    """Rotate numbered backups without removing the live state file.
+
+    The live file is copied to `.1` rather than renamed there, so a failed
+    write still leaves the previous session at `STATE_FILE`.
+    """
+    if not STATE_FILE.exists():
+        return ""
+    try:
+        for i in range(3, 1, -1):
+            src = STATE_FILE.with_name(f"{STATE_FILE.name}.{i - 1}")
+            dst = STATE_FILE.with_name(f"{STATE_FILE.name}.{i}")
+            if src.exists():
+                if dst.exists():
+                    dst.unlink()
+                src.replace(dst)
+        first = STATE_FILE.with_name(f"{STATE_FILE.name}.1")
+        if first.exists():
+            first.unlink()
+        shutil.copy2(STATE_FILE, first)
+        log.info("Rotated backups: %s -> %s.1/.2/.3", STATE_FILE, STATE_FILE)
+        return " (backup .1 created)"
+    except OSError as exc:
+        log.warning("Backup rotation failed for %s: %s", STATE_FILE, exc)
+        return ""
+
+
+def save_session(*, notify_user: bool = True) -> bool:
     """Save the current Sway/i3 session to disk.
 
     Serialize every workspace, the hidden scratchpad, background apps, and
     the focused workspace, then rotate the previous state file to a numbered
-    backup before writing the new one. Report an unreachable compositor
-    without raising.
+    backup before writing the new one. Report an unreachable compositor or a
+    failed write without raising.
 
     Args:
         notify_user: Whether to show desktop notifications.
+
+    Returns:
+        True when a snapshot was written, False when the compositor was
+        unreachable or the file could not be written.
     """
     backup_msg = ""
     try:
@@ -133,35 +187,19 @@ def save_session(*, notify_user: bool = True) -> None:
                 focused_workspace=_focused_workspace_name(tree),
             ).to_payload()
 
-            # Rotate backups before overwriting:
-            # STATE_FILE.3 <- .2 <- .1 <- STATE_FILE
-            backup_msg = ""
-            if STATE_FILE.exists():
-                try:
-                    for i in range(3, 0, -1):
-                        src = (
-                            STATE_FILE
-                            if i == 1
-                            else STATE_FILE.with_name(f"{STATE_FILE.name}.{i - 1}")
-                        )
-                        dst = STATE_FILE.with_name(f"{STATE_FILE.name}.{i}")
-                        if src.exists():
-                            try:
-                                if dst.exists():
-                                    dst.unlink()
-                            except OSError:
-                                pass
-                            src.replace(dst)
-                    backup_msg = " (backup .1 created)"
-                    log.info(
-                        "Rotated backups: %s -> %s.1/.2/.3", STATE_FILE, STATE_FILE
-                    )
-                except OSError as exc:
-                    log.warning("Backup rotation failed for %s: %s", STATE_FILE, exc)
-
             # Authoritative single commit. Restore reads background_apps from
             # this file when present, preventing mixed-generation restore.
-            _atomic_write(STATE_FILE, json.dumps(payload, indent=2))
+            # Write the new payload before touching the live file, so a failed
+            # write cannot leave the user without a restorable session.
+            content = json.dumps(payload, indent=2)
+            tmp_path = _write_temp(STATE_FILE, content)
+            try:
+                backup_msg = _rotate_backups()
+                os.replace(tmp_path, STATE_FILE)
+                _fsync_dir(STATE_DIR)
+            except OSError:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
             # Sidecar for tools that read the background apps file
             # directly. It must not fail the main save.
@@ -184,9 +222,15 @@ def save_session(*, notify_user: bool = True) -> None:
         log.warning("Cannot reach the window manager: %s", exc)
         if notify_user:
             notify("session save failed: cannot reach the window manager")
-        return
+        return False
+    except OSError as exc:
+        log.warning("Could not write session file %s: %s", STATE_FILE, exc)
+        if notify_user:
+            notify("session save failed: could not write the session file")
+        return False
     finally:
         close_connection()
 
     if notify_user:
         notify(f"session saved successfully{backup_msg}")
+    return True
