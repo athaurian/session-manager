@@ -39,6 +39,14 @@ class RestoreContext:
         with self._lock:
             self.missing.append(message)
 
+    def discard_missing(self, message: str) -> None:
+        """Forget a missing window that was recovered later in the run."""
+        with self._lock:
+            try:
+                self.missing.remove(message)
+            except ValueError:
+                pass
+
     # Helium group restore state
     helium_saved_nodes: list[dict] = field(default_factory=list)
     helium_saved_index: dict[int, int] = field(default_factory=dict)

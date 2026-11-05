@@ -26,6 +26,7 @@ from .config import (
     RESTORE_STAGING_WORKSPACE,
     SCRATCH_RESTORE_WORKSPACE,
     SCRATCHPAD_WORKSPACE,
+    STAGING_WORKSPACES,
     STATE_DIR,
     STATE_FILE,
     canonical_app_id,
@@ -118,11 +119,17 @@ def _normalise_restore_payload(
     snapshot = Snapshot.from_payload(payload)
     for issue in snapshot.issues:
         log.warning("Session payload issue: %s", issue)
+    workspaces = [
+        ws for ws in snapshot.workspaces if ws.get("name") not in STAGING_WORKSPACES
+    ]
+    focused = snapshot.focused_workspace
+    if focused in STAGING_WORKSPACES:
+        focused = None
     return (
-        snapshot.workspaces,
+        workspaces,
         snapshot.hidden_scratchpad,
         snapshot.background_apps,
-        snapshot.focused_workspace,
+        focused,
     )
 
 
@@ -508,6 +515,192 @@ def _reconcile_placements(
                 f"expected {name!r}"
             )
     log.info("Reconciled %d misplaced window(s)", len(moved))
+
+
+# Windows are staged on these restore-only workspaces until the arrangement
+# walk places them. A slow application can map its window after its launch
+# wait has already given up, so the recovery pass below looks there for
+# orphans.
+
+
+def _saved_window_targets(
+    workspaces: list[dict], hidden_scratchpad: list[dict]
+) -> list[tuple[dict, str | None, bool]]:
+    """Return every saved window with its target workspace and float state."""
+    targets: list[tuple[dict, str | None, bool]] = []
+
+    def collect(node: dict, workspace: str | None, floating: bool) -> None:
+        """Collect windows under a saved node, tracking float membership."""
+        if node.get("type") == "window":
+            targets.append((node, workspace, floating))
+            return
+        for child in node.get("nodes", []):
+            collect(child, workspace, floating)
+        for child in node.get("floating_nodes", []):
+            collect(child, workspace, True)
+
+    for workspace in workspaces:
+        name = workspace.get("name")
+        if isinstance(name, str):
+            collect(workspace, name, False)
+    for node in hidden_scratchpad:
+        collect(node, None, True)
+    return targets
+
+
+def _staged_live_windows(tree: dict) -> list[dict]:
+    """Return the live windows still sitting on a restore staging workspace."""
+    placements = _live_window_placements(tree)
+    windows = {
+        node["id"]: node
+        for node in _live_window_nodes(tree)
+        if node.get("id") is not None
+    }
+    return [
+        windows[win_id]
+        for win_id, workspace in placements.items()
+        if workspace in STAGING_WORKSPACES and win_id in windows
+    ]
+
+
+def _staging_workspace_names() -> list[str]:
+    """Return the staging workspaces that are still in the live tree."""
+    try:
+        tree = get_tree()
+    except OSError:
+        return []
+    return [
+        node["name"]
+        for node in walk_tree(tree)
+        if node.get("type") == "workspace" and node.get("name") in STAGING_WORKSPACES
+    ]
+
+
+def _place_recovered_window(
+    node: dict, win_id: int, workspace: str | None, floating: bool, ctx: RestoreContext
+) -> None:
+    """Place a window that mapped after its launch wait gave up."""
+    if workspace is None:
+        _restore_hidden_scratchpad(node, ctx)
+        return
+    previous = ctx.current_workspace
+    ctx.current_workspace = workspace
+    try:
+        if floating:
+            _restore_floating(node, ctx)
+        else:
+            _restore_node(node, ctx)
+    finally:
+        ctx.current_workspace = previous
+
+
+def _recover_staged_windows(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> int:
+    """Adopt windows that mapped after their launch wait timed out.
+
+    A slow application can create its window after the wait has already
+    reported it missing. The window still belongs to this restore, so it is
+    matched to its saved node, placed, and removed from the missing list.
+    Windows that match nothing are moved off staging and reported, so the
+    staging workspace can always be removed.
+    """
+    try:
+        tree = get_tree()
+    except OSError:
+        return 0
+
+    staged = _staged_live_windows(tree)
+    if not staged:
+        return 0
+
+    placements = _live_window_placements(tree)
+    targets = _saved_window_targets(workspaces, hidden_scratchpad)
+    pending = [
+        target
+        for target in targets
+        if _placed_window_id(target[0], ctx) not in placements
+    ]
+
+    used: set[int] = set()
+    recovered = 0
+    for live in staged:
+        win_id = live["id"]
+        if win_id in ctx.claimed_ids:
+            continue
+        exact: tuple[dict, str | None, bool] | None = None
+        identity: tuple[dict, str | None, bool] | None = None
+        for target in pending:
+            node = target[0]
+            if id(node) in used:
+                continue
+            if not _same_app_identity(live, node):
+                continue
+            if isinstance(node.get("name"), str) and live.get("name") == node.get(
+                "name"
+            ):
+                exact = target
+                break
+            if identity is None:
+                identity = target
+        match = exact or identity
+        if match is None:
+            continue
+        node, workspace, floating = match
+        used.add(id(node))
+        ctx.claimed_ids.add(win_id)
+        ctx.registry.adopt(node, win_id)
+        ctx.discard_missing(_failure_label(node))
+        try:
+            _place_recovered_window(node, win_id, workspace, floating, ctx)
+        except Exception as exc:
+            log.exception("Failed to place recovered %s", _failure_label(node))
+            ctx.add_failure(f"{_failure_label(node)}: {exc}")
+        recovered += 1
+        log.info("Recovered late window %s for %s", win_id, _failure_label(node))
+
+    associated = {
+        win_id
+        for node, _workspace, _floating in targets
+        if (win_id := _placed_window_id(node, ctx)) is not None
+    }
+    fallback = next(
+        (
+            workspace["name"]
+            for workspace in workspaces
+            if isinstance(workspace.get("name"), str)
+        ),
+        "1",
+    )
+    for live in staged:
+        win_id = live["id"]
+        if win_id in associated:
+            continue
+        label = str(live.get("name") or node_app_id(live) or win_id)
+        ctx.add_failure(f"{label}: restored window did not match a saved window")
+        _ensure_on_workspace(win_id, fallback)
+
+    if recovered:
+        log.info("Recovered %d late window(s) from staging", recovered)
+    return recovered
+
+
+def _finish_staging(
+    workspaces: list[dict],
+    hidden_scratchpad: list[dict],
+    ctx: RestoreContext,
+    destination: str,
+) -> None:
+    """Leave the staging workspaces and sweep anything that mapped late."""
+    cmd(_workspace_cmd(destination))
+    if not _staging_workspace_names():
+        return
+    _recover_staged_windows(workspaces, hidden_scratchpad, ctx)
+    _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+    cmd(_workspace_cmd(destination))
+    remaining = _staging_workspace_names()
+    if remaining:
+        ctx.add_failure(f"staging workspace not removed: {', '.join(remaining)}")
 
 
 def has_restorable_content() -> bool:
@@ -1266,13 +1459,22 @@ def _restore_session_locked(
         # after the walk places them, and an interrupted restore leaves some
         # of them elsewhere; this pass moves them back by con id and verifies
         # the result before the session is reported as restored.
+        _recover_staged_windows(workspaces, hidden_scratchpad, ctx)
         _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+
+        # Leave the staging workspaces only after they are empty. A window
+        # that mapped during the reconcile pass is swept once more so the
+        # staging workspace cannot survive as an orphan.
+        _finish_staging(
+            workspaces,
+            hidden_scratchpad,
+            ctx,
+            focused_workspace or "1",
+        )
 
         # Windows that failed on their own are collected here, so the
         # summary can report them without aborting the session.
         partial_failures.extend(ctx.failures)
-
-        cmd(_workspace_cmd(focused_workspace) if focused_workspace else "workspace 1")
 
     except Exception:
         _notify("session restore failed")

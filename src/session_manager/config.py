@@ -74,6 +74,9 @@ SCRATCH_RESTORE_WORKSPACE = "__scratch_restore"
 # Visible windows are materialized here before they are placed. i3 refuses
 # names that start with "__", so this one must stay a normal workspace name.
 RESTORE_STAGING_WORKSPACE = "_session_restore"
+# Restore-only workspaces are an implementation detail. They are never saved
+# as user workspaces and are dropped from an older state file.
+STAGING_WORKSPACES = frozenset({RESTORE_STAGING_WORKSPACE, SCRATCH_RESTORE_WORKSPACE})
 
 DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600

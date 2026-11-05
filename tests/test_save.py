@@ -42,6 +42,11 @@ class TestFocusedWorkspaceName(unittest.TestCase):
         tree = self._tree([make_workspace("1"), scratch])
         self.assertIsNone(save_mod._focused_workspace_name(tree))
 
+    def test_focused_restore_staging_workspace_ignored(self):
+        staging = make_workspace("_session_restore", nodes=[make_window("kitty")])
+        staging["focused"] = True
+        self.assertIsNone(save_mod._focused_workspace_name(self._tree([staging])))
+
     def test_nothing_focused(self):
         tree = self._tree([make_workspace("1")])
         self.assertIsNone(save_mod._focused_workspace_name(tree))
@@ -164,6 +169,14 @@ class TestSaveSession(unittest.TestCase):
         self._save()
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         self.assertEqual(len(payload["hidden_scratchpad"]), 2)
+
+    def test_restore_staging_workspace_is_not_saved(self):
+        staging = make_workspace("_session_restore", nodes=[make_window("calibre-gui")])
+        self.tree["nodes"][0]["nodes"].append(staging)
+        self._save()
+        payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        names = [workspace["name"] for workspace in payload["workspaces"]]
+        self.assertEqual(names, ["1"])
 
     def test_previous_saves_are_rotated(self):
         self.state_file.write_text("current", encoding="utf-8")

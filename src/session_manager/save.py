@@ -13,6 +13,7 @@ from .config import (
     BACKGROUND_APPS_FILE,
     NVIM_SESSION_DIR,
     SCRATCHPAD_WORKSPACE,
+    STAGING_WORKSPACES,
     STATE_DIR,
     STATE_FILE,
 )
@@ -34,7 +35,11 @@ def _focused_workspace_name(tree: dict) -> str | None:
         if node.get("type") == "workspace":
             ws_name = node.get("name")
         if node.get("focused"):
-            return ws_name if ws_name and ws_name != SCRATCHPAD_WORKSPACE else None
+            if not ws_name:
+                return None
+            if ws_name == SCRATCHPAD_WORKSPACE or ws_name in STAGING_WORKSPACES:
+                return None
+            return ws_name
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
             found = _walk(child, ws_name)
             if found:
@@ -109,6 +114,10 @@ def save_session(*, notify_user: bool = True) -> None:
                     for child in ws.get("floating_nodes", []):
                         for cleaned in clean_floating(child, cache):
                             hidden_scratchpad.extend(_flatten_windows(cleaned))
+                    continue
+                if ws.get("name") in STAGING_WORKSPACES:
+                    # A restore staging workspace is an implementation
+                    # detail, never part of a user's saved session.
                     continue
                 cleaned = clean_tree(ws, cache)
                 if cleaned and (cleaned.get("nodes") or cleaned.get("floating_nodes")):

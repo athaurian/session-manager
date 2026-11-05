@@ -84,6 +84,18 @@ class TestNormalisePayload(RestoreHarnessTestCase):
         workspaces, _, _, _ = self._norm({"workspaces": [bad, good]})
         self.assertEqual([ws["name"] for ws in workspaces], ["1"])
 
+    def test_restore_staging_workspace_is_dropped(self):
+        payload = {
+            "workspaces": [
+                make_workspace("_session_restore", nodes=[make_window("kitty")]),
+                make_workspace("1", nodes=[make_window("kitty")]),
+            ],
+            "focused_workspace": "_session_restore",
+        }
+        workspaces, _, _, focused = self._norm(payload)
+        self.assertEqual([ws["name"] for ws in workspaces], ["1"])
+        self.assertIsNone(focused)
+
 
 class TestRestoreNode(RestoreHarnessTestCase):
     def test_workspace_restores_tiled_and_floating_children(self):
@@ -921,6 +933,157 @@ class TestReconcilePlacements(RestoreHarnessTestCase):
             self.restore_mod._reconcile_placements([ws], [], ctx)
         self.assertEqual(ctx.missing, [])
         self.assertEqual(self.calls, [])
+
+
+class TestRecoverStagedWindows(RestoreHarnessTestCase):
+    """A window that maps after its launch wait is still placed."""
+
+    def _ctx(self, *adopted):
+        ctx = self.restore_mod.RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        for node, win_id in adopted:
+            ctx.registry.adopt(node, win_id)
+        return ctx
+
+    def _staging_tree(self, *windows):
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": self.restore_mod.RESTORE_STAGING_WORKSPACE,
+                            "nodes": list(windows),
+                            "floating_nodes": [],
+                        }
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def _live(self, win_id, app_id, name):
+        return {
+            "type": "con",
+            "id": win_id,
+            "app_id": app_id,
+            "name": name,
+            "pid": 4242,
+            "nodes": [],
+            "floating_nodes": [],
+        }
+
+    def test_late_visible_window_is_adopted_and_moved(self):
+        win = make_window("calibre-gui", name="Library - calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx()
+        ctx.add_missing("Library - calibre")
+        tree = self._staging_tree(self._live(801, "calibre-gui", "Library - calibre"))
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_window_workspace_name",
+                lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
+            ),
+        ):
+            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(ctx.registry.resolve(win), 801)
+        self.assertCommand("[con_id=801] move to workspace 7")
+
+    def test_late_hidden_window_is_parked(self):
+        from session_manager.config import SCRATCHPAD_WORKSPACE
+
+        win = make_window("kitty", name="heavy-hidden-1")
+        ctx = self._ctx()
+        ctx.add_missing("heavy-hidden-1")
+        tree = self._staging_tree(self._live(802, "kitty", "heavy-hidden-1"))
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_window_workspace_name",
+                lambda _win_id: SCRATCHPAD_WORKSPACE,
+            ),
+        ):
+            recovered = self.restore_mod._recover_staged_windows([], [win], ctx)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(ctx.registry.resolve(win), 802)
+        self.assertCommand("[con_id=802] move scratchpad")
+        self.assertNotIn("scratchpad show", " ".join(self.calls))
+
+    def test_unmatched_staged_window_is_reported_and_moved(self):
+        saved = make_window("kitty", name="alpha")
+        ws = make_workspace("1", nodes=[saved])
+        ctx = self._ctx((saved, 900))
+        tree = self._staging_tree(self._live(803, "mpv", "video - mpv"))
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_window_workspace_name",
+                lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
+            ),
+        ):
+            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 0)
+        self.assertTrue(
+            any("did not match a saved window" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+        self.assertCommand("[con_id=803] move to workspace 1")
+
+    def test_finish_staging_sweeps_a_workspace_that_survived(self):
+        ctx = self._ctx()
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_staging_workspace_names",
+                side_effect=[["_session_restore"], []],
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod, "_recover_staged_windows", return_value=1
+            ) as recover,
+            unittest.mock.patch.object(
+                self.restore_mod, "_reconcile_placements"
+            ) as reconcile,
+        ):
+            self.restore_mod._finish_staging([], [], ctx, "2")
+
+        self.assertEqual(self.calls, ["workspace 2", "workspace 2"])
+        recover.assert_called_once()
+        reconcile.assert_called_once()
+        self.assertEqual(ctx.failures, [])
+
+    def test_finish_staging_reports_a_workspace_that_will_not_leave(self):
+        ctx = self._ctx()
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_staging_workspace_names",
+                side_effect=[["_session_restore"], ["_session_restore"]],
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod, "_recover_staged_windows", return_value=0
+            ),
+            unittest.mock.patch.object(self.restore_mod, "_reconcile_placements"),
+        ):
+            self.restore_mod._finish_staging([], [], ctx, "2")
+
+        self.assertTrue(
+            any("staging workspace not removed" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
 
 
 class TestHiddenScratchpad(RestoreHarnessTestCase):
