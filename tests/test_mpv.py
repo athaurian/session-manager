@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 
 import session_manager.apps.generic as gen_mod
 import session_manager.apps.mpv as mpv_mod
@@ -28,6 +29,47 @@ class TestGetMpvInfo(unittest.TestCase):
     def test_returns_empty_without_a_command_line(self):
         with unittest.mock.patch.object(mpv_mod, "read_cmdline", return_value=[]):
             self.assertEqual(mpv_mod.get_mpv_info(10), "")
+
+    def test_a_relative_path_is_resolved_against_the_mpv_cwd(self):
+        """mpv opened the file from its own directory, not the manager's."""
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "clip.mkv"
+            media.write_bytes(b"")
+            with unittest.mock.patch.object(
+                mpv_mod, "read_cmdline", return_value=["mpv", "clip.mkv"]
+            ):
+                self.assertEqual(mpv_mod.get_mpv_info(10, tmp), str(media))
+
+    def test_a_relative_path_without_a_cwd_is_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "clip.mkv"
+            media.write_bytes(b"")
+            with unittest.mock.patch.object(
+                mpv_mod, "read_cmdline", return_value=["mpv", "clip.mkv"]
+            ):
+                self.assertEqual(mpv_mod.get_mpv_info(10), "")
+
+
+class TestCaptureMpv(unittest.TestCase):
+    def test_capture_uses_the_process_cwd_for_a_relative_path(self):
+        from session_manager.proc_cache import ProcCache, ProcEntry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "clip.mkv"
+            media.write_bytes(b"")
+            cache = ProcCache()
+            cache._entries[10] = ProcEntry(
+                pid=10,
+                ppid=1,
+                comm="mpv",
+                cmdline=["mpv", "clip.mkv"],
+                cwd=tmp,
+            )
+            with unittest.mock.patch.object(
+                mpv_mod, "read_cmdline", return_value=["mpv", "clip.mkv"]
+            ):
+                info = mpv_mod.capture_mpv({}, 10, cache)
+        self.assertEqual(info["media_path"], str(media))
 
 
 class TestLaunchMpv(unittest.TestCase):

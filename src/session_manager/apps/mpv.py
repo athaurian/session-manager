@@ -12,17 +12,29 @@ from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
 
 
-def get_mpv_info(pid: int) -> str:
-    """Return the media path from an mpv command line."""
+def get_mpv_info(pid: int, cwd: str = "") -> str:
+    """Return the media path from an mpv command line.
+
+    A relative path is resolved against the mpv process's own working
+    directory, because that is the directory mpv opened the file from.
+    The manager's own working directory is a different one.
+    """
     for arg in reversed(read_cmdline(pid)[1:]):
-        if arg and not arg.startswith("-") and Path(arg).is_file():
-            return arg
+        if not arg or arg.startswith("-"):
+            continue
+        path = Path(arg)
+        if not path.is_absolute() and cwd:
+            path = Path(cwd) / path
+        if path.is_file():
+            return str(path)
     return ""
 
 
-def capture_mpv(_source: dict, pid: int, _cache: ProcCache) -> dict[str, object]:
+def capture_mpv(_source: dict, pid: int, cache: ProcCache) -> dict[str, object]:
     """Return the saved media file for an mpv window."""
-    return {"media_path": get_mpv_info(pid)}
+    entry = cache.get(pid)
+    cwd = entry.cwd if entry else ""
+    return {"media_path": get_mpv_info(pid, cwd)}
 
 
 def launch_mpv(node: dict, claimed_ids: MutableSet[int]) -> int | None:

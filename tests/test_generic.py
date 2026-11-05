@@ -53,6 +53,22 @@ class TestGetCmdFromAppId(unittest.TestCase):
                     ["gtk-launch", "sm_test_app"],
                 )
 
+    def test_a_mixed_case_desktop_id_is_found(self):
+        """Desktop entry names keep the case their vendor chose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            user_apps = Path(tmp) / ".local" / "share" / "applications"
+            user_apps.mkdir(parents=True)
+            (user_apps / "org.example.MixedCase.desktop").write_text(
+                "[Desktop Entry]\n", encoding="utf-8"
+            )
+            with unittest.mock.patch.object(
+                gen_mod.Path, "home", classmethod(lambda cls: Path(tmp))
+            ):
+                self.assertEqual(
+                    gen_mod.get_cmd_from_app_id("org.example.mixedcase", ""),
+                    ["gtk-launch", "org.example.MixedCase"],
+                )
+
 
 class TestWaitForWindowByPid(unittest.TestCase):
     def test_matches_new_event_by_pid(self):
@@ -320,6 +336,41 @@ class TestLaunchDispatch(unittest.TestCase):
         self.assertEqual(result, 12)
         self.assertEqual(claimed, {12})
         self.assertEqual(popen.commands, [["some-app"]])
+
+    def test_a_gtk_launch_command_does_not_fail_fast_on_exit(self):
+        """`gtk-launch` exits before the app's window appears."""
+        with (
+            unittest.mock.patch.object(
+                gen_mod,
+                "get_cmd_from_app_id",
+                return_value=["gtk-launch", "org.keepassxc.KeePassXC"],
+            ),
+            unittest.mock.patch.object(gen_mod, "matching_window_ids", return_value=[]),
+            unittest.mock.patch.object(gen_mod.subprocess, "Popen", RecordingPopen()),
+            unittest.mock.patch.object(gen_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=12
+            ) as wait,
+        ):
+            gen_mod.launch_and_get_id(
+                {"app_id": "org.keepassxc.KeePassXC", "class": ""}, set()
+            )
+        self.assertFalse(wait.call_args.kwargs["fail_fast_on_exit"])
+
+    def test_a_direct_command_fails_fast_when_the_process_exits(self):
+        with (
+            unittest.mock.patch.object(
+                gen_mod, "get_cmd_from_app_id", return_value=["vesktop"]
+            ),
+            unittest.mock.patch.object(gen_mod, "matching_window_ids", return_value=[]),
+            unittest.mock.patch.object(gen_mod.subprocess, "Popen", RecordingPopen()),
+            unittest.mock.patch.object(gen_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=12
+            ) as wait,
+        ):
+            gen_mod.launch_and_get_id({"app_id": "vesktop", "class": ""}, set())
+        self.assertTrue(wait.call_args.kwargs["fail_fast_on_exit"])
 
     def test_singleton_app_is_not_launched_twice(self):
         with (

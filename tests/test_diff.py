@@ -72,6 +72,17 @@ class TestUnreadableInput(DiffTestCase):
         self.assertIn("Saved session unreadable", output.getvalue())
         get_tree.assert_not_called()
 
+    def test_a_file_that_is_not_utf8_is_reported(self):
+        self.state_file.write_bytes(b'{"workspaces": [\xff]}')
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(restore_mod, "get_tree") as get_tree,
+            redirect_stdout(output),
+        ):
+            self.assertFalse(restore_mod.diff_sessions())
+        self.assertIn("Saved session unreadable", output.getvalue())
+        get_tree.assert_not_called()
+
     def test_live_tree_failure_is_reported(self):
         self.state_file.write_text(json.dumps(saved_payload([])), encoding="utf-8")
         with unittest.mock.patch.object(

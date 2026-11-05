@@ -175,12 +175,15 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop("SWAY_SESSION_SKIP_DAEMON_CHECKS", None)
 
-    def _run_checks(self, results=None, backend="sway"):
+    def _run_checks(self, results=None, backend="sway", load_state="loaded"):
         results = results or {}
         calls = []
 
         def fake_run(command, **_kwargs):
-            calls.append(list(command))
+            command = list(command)
+            calls.append(command)
+            if "show" in command and "LoadState" in command:
+                return unittest.mock.Mock(returncode=0, stdout=f"{load_state}\n")
             return unittest.mock.Mock(returncode=results.get(" ".join(command), 0))
 
         with (
@@ -203,6 +206,17 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
         calls, notify = self._run_checks({"pgrep -x swayidle": 1})
         self.assertIn(["systemctl", "--user", "start", "--no-block", "swayidle"], calls)
         notify.assert_called_once()
+
+    def test_a_daemon_the_system_does_not_ship_is_skipped(self):
+        """A missing pipewire on a system without it is not a problem."""
+        calls, notify = self._run_checks(
+            {"pgrep -x pipewire": 1, "pgrep -x pipewire-pulse": 1},
+            load_state="not-found",
+        )
+        self.assertNotIn(
+            ["systemctl", "--user", "start", "--no-block", "pipewire"], calls
+        )
+        notify.assert_not_called()
 
     def test_reports_but_does_not_restart_a_missing_xss_lock(self):
         calls, notify = self._run_checks({"pgrep -x xss-lock": 1}, backend="i3")

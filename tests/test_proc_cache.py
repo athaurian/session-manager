@@ -85,6 +85,33 @@ class TestProcCache(unittest.TestCase):
         self._inject(cache, 22, 0, "vesktop")
         self.assertFalse(cache.cmdline_contains("/vesktop"))
 
+    def test_zellij_session_name_from_a_flag(self):
+        cache = ProcCache()
+        self._inject(cache, 31, 0, "kitty")
+        self._inject(cache, 32, 31, "zellij", cmdline=["zellij", "--session", "work"])
+        self.assertEqual(cache.get_zellij_session(31), "work")
+
+    def test_zellij_session_name_from_attach(self):
+        """`zellij attach <name>` joins an existing session."""
+        cache = ProcCache()
+        self._inject(cache, 33, 0, "kitty")
+        self._inject(cache, 34, 33, "zellij", cmdline=["zellij", "attach", "work"])
+        self.assertEqual(cache.get_zellij_session(33), "work")
+
+    def test_zellij_session_name_from_attach_with_create(self):
+        cache = ProcCache()
+        self._inject(cache, 35, 0, "kitty")
+        self._inject(
+            cache, 36, 35, "zellij", cmdline=["zellij", "attach", "-c", "scratch"]
+        )
+        self.assertEqual(cache.get_zellij_session(35), "scratch")
+
+    def test_zellij_attach_without_a_name_has_no_session(self):
+        cache = ProcCache()
+        self._inject(cache, 37, 0, "kitty")
+        self._inject(cache, 38, 37, "zellij", cmdline=["zellij", "attach"])
+        self.assertEqual(cache.get_zellij_session(37), "zellij")
+
     def test_get_missing(self):
         self.assertIsNone(ProcCache().get(999999))
 

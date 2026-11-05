@@ -40,6 +40,34 @@ __all__ = [
 ]
 
 
+def _desktop_entry(candidate: str) -> str:
+    """Return the desktop entry id for a candidate, if there is one.
+
+    Desktop entry names keep the case their vendor chose, so an id that is
+    only known in lower case still has to find its file. The name that is
+    returned is the one on disk, because `gtk-launch` needs it.
+    """
+    if not candidate:
+        return ""
+    for apps_dir in (
+        Path.home() / ".local" / "share" / "applications",
+        Path("/usr/share/applications"),
+    ):
+        direct = apps_dir / f"{candidate}.desktop"
+        if direct.exists():
+            return candidate
+        try:
+            entries = sorted(apps_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.name.endswith(".desktop"):
+                continue
+            if entry.name[: -len(".desktop")].lower() == candidate.lower():
+                return entry.name[: -len(".desktop")]
+    return ""
+
+
 def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
     """Return a launch command for an app identity, if one is known.
 
@@ -52,16 +80,10 @@ def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
     if cmd:
         return shlex.split(cmd)
     desktop_id = canonical or class_name
-    if desktop_id:
-        for candidate in (desktop_id, desktop_id.lower(), class_name.lower()):
-            if not candidate:
-                continue
-            for apps_dir in (
-                Path.home() / ".local" / "share" / "applications",
-                Path("/usr/share/applications"),
-            ):
-                if (apps_dir / f"{candidate}.desktop").exists():
-                    return ["gtk-launch", candidate]
+    for candidate in (desktop_id, class_name):
+        found = _desktop_entry(candidate)
+        if found:
+            return ["gtk-launch", found]
     return []
 
 
@@ -263,6 +285,11 @@ def launch_generic(node: dict, claimed_ids: MutableSet[int]) -> int | None:
         log.info("Skipping %s: instance already exists", app_id)
         return None
 
+    # `gtk-launch` starts the app and exits straight away, so its process is
+    # gone before the window appears. Treating that exit as a failed launch
+    # would abandon the app while it is still starting.
+    fail_fast_on_exit = app_id in APP_ID_COMMANDS and cmd_args[0] != "gtk-launch"
+
     win_id = None
     proc = None
     with WindowEventWatcher() as watcher:
@@ -283,7 +310,7 @@ def launch_generic(node: dict, claimed_ids: MutableSet[int]) -> int | None:
                 baseline_ids=baseline_ids,
                 claimed_ids=claimed_ids,
                 process=proc,
-                fail_fast_on_exit=app_id in APP_ID_COMMANDS,
+                fail_fast_on_exit=fail_fast_on_exit,
             )
         finally:
             reap_if_needed(proc)

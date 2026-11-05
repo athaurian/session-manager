@@ -52,6 +52,28 @@ def detect_background_apps(
     return apps
 
 
+def _unit_installed(service: str) -> bool:
+    """Report whether a systemd user unit for a daemon is installed.
+
+    A daemon the system does not ship has not gone missing, so it is
+    skipped instead of warned about. When the answer cannot be read the
+    daemon is assumed to be there, which keeps the old behaviour.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", service, "-p", "LoadState", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired, TypeError):
+        return True
+    if result.returncode != 0:
+        return True
+    return result.stdout.strip() != "not-found"
+
+
 def _ensure_background_daemons(notify_user: bool = True) -> None:
     """Perform a best-effort health check for daily-use daemons.
 
@@ -104,6 +126,13 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=1.0, check=False)
             if r.returncode != 0:
+                if service is not None and not _unit_installed(service):
+                    # The system does not ship this daemon, so it has
+                    # not gone missing.
+                    log.debug(
+                        "Skipping %s: no %s user unit is installed", name, service
+                    )
+                    continue
                 msg = f"Background daemon {label} not running, attempting restart"
                 log.warning(msg)
                 if notify_user:
@@ -172,7 +201,7 @@ def restore_background_apps(
             return
         try:
             loaded = json.loads(BACKGROUND_APPS_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             log.warning("Could not parse %s", BACKGROUND_APPS_FILE)
             return
         if not isinstance(loaded, list):
