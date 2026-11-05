@@ -447,7 +447,10 @@ def main() -> int:
         print_summary(summary)
     if len(summaries) == 2:
         print_delta(summaries[0], summaries[1])
-    return 0
+    failed = any(
+        not result["layout_ok"] for runs in results.values() for result in runs
+    )
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
