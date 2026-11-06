@@ -65,7 +65,7 @@ def _unit_installed(service: str) -> bool:
             timeout=1.0,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired, TypeError):
+    except (OSError, subprocess.SubprocessError):
         return True
     if result.returncode != 0:
         return True
@@ -141,19 +141,9 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
                         timeout=2.0,
                         check=False,
                     )
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    subprocess.TimeoutExpired,
-                    TypeError,
-                ):
+                except (OSError, subprocess.SubprocessError):
                     pass
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            subprocess.TimeoutExpired,
-            TypeError,
-        ):
+        except (OSError, subprocess.SubprocessError):
             continue
 
     # Ensure the session target is active (covers polkit, portal, etc. via
@@ -178,7 +168,7 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
                 timeout=2.0,
                 check=False,
             )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired, TypeError):
+    except (OSError, subprocess.SubprocessError):
         pass
 
 

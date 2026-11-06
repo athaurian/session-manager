@@ -14,7 +14,6 @@ class FakeCache:
     def __init__(self, running: bool = False, cmdline: str = ""):
         self.running = running
         self.cmdline = cmdline
-        self.snapshot_calls = 0
 
     def process_named_running(self, name):
         return self.running
