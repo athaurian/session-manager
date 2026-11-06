@@ -64,12 +64,12 @@ class WindowRegistry:
     on demand.
     """
 
-    def __init__(self, max_workers: int = MATERIALIZE_WORKERS) -> None:
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._events: dict[int, threading.Event] = {}
         self._results: dict[int, int | None] = {}
         self._pool = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="session-materialize"
+            max_workers=MATERIALIZE_WORKERS, thread_name_prefix="session-materialize"
         )
 
     def submit(self, nodes: list[dict], task: Callable[[], None]) -> threading.Event:

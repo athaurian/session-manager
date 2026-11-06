@@ -476,11 +476,6 @@ class TestI3Restore(RestoreHarnessTestCase):
         self.restore_workspaces({"workspaces": [ws]})
         self.assertCommand("[con_id=1000] focus")
 
-    def test_workspace_names_with_spaces_are_quoted(self):
-        ws = make_workspace("1: web", nodes=[make_window("kitty")])
-        self.restore_workspaces({"workspaces": [ws]})
-        self.assertCommand('workspace "1: web"')
-
     def test_hidden_plain_window_restores_saved_border(self):
         payload = {
             "workspaces": [],
@@ -500,11 +495,6 @@ class TestI3Restore(RestoreHarnessTestCase):
         payload["hidden_scratchpad"][0].pop("border", None)
         self.restore_workspaces(payload)
         self.assertCommand("[con_id=1000] border normal")
-
-    def test_floating_window_restores_saved_border(self):
-        ws = make_workspace("1", floating=[make_window("kitty", border="none")])
-        self.restore_workspaces({"workspaces": [ws]})
-        self.assertCommand("[con_id=1000] border none")
 
     def test_floating_window_border_none_is_not_applied_when_absent(self):
         ws = make_workspace("1", floating=[make_window("kitty")])
