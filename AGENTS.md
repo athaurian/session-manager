@@ -26,7 +26,12 @@ on this file.
 - `model.py` owns the saved-session contract and per-node validation.
 - `ipc.py` owns the Sway/i3 wire protocol: a shared request/reply connection
   plus dedicated connections for event subscriptions.
-- `apps/` owns per-application capture and launch behavior. `config.py` holds
+- `sway_tree.py` owns the capture-side tree cleanup: `clean_tree` /
+  `clean_floating` decide what a save records.
+- `registry.py` owns live-window ownership (`WindowRegistry`): which live
+  container id belongs to which saved window.
+- `apps/` owns per-application capture and launch behavior.
+  `apps/handlers.py` maps each app to its handler; `config.py` holds
   app profiles, launch commands, aliases, and shared timeouts.
 - `nvim/` owns Neovim session snapshots and RPC.
 - `background.py` owns tray-app restore and daemon health checks.
@@ -54,16 +59,19 @@ on this file.
 
 ## Invariants
 
-- The saved payload is versioned. Bump `model.CURRENT_VERSION` and add a
-  migration when its shape changes. Unknown future versions are refused.
+- The saved payload is versioned. Bump `model.CURRENT_VERSION` when its shape
+  changes and teach `Snapshot.from_payload` to read the previous shape; unknown
+  future versions are refused.
 - Validation repairs per node. One bad window or workspace is dropped with a
   warning; it must not reject the rest of the session.
 - Placement is asserted, never inferred. Every restored window is moved to its
   saved workspace by `con_id`. Do not rely on which workspace is focused when
   the window maps.
-- Visibility is asserted. Hidden scratchpad windows are only ever parked with
-  `move scratchpad`; they are never `scratchpad show`n, and the result is
-  verified.
+- Visibility is asserted. A `hidden_scratchpad` entry is only ever parked with
+  `move scratchpad`; it is never `scratchpad show`n, and the park is verified.
+  A window saved visible on a workspace with a non-`none` `scratchpad_state` is
+  deliberately re-shown (`restore.py:1524-1531`); that path has no test of its
+  own.
 - A window's identity is matched by pid, app id, or title. `claimed_ids`
   prevents one live window from being assigned to two saved windows.
 - `operation_lock` serializes save and restore across processes.
@@ -115,6 +123,7 @@ workflow tests Python 3.11 and 3.13. The Make targets fetch pinned `ruff` and
 
 ## Known debt
 
-`CONTEXT.md` tracks the current correctness rework, its remaining phases, and
-the known gaps. Update it when the branch state changes, and delete it once the
+`notes/CONTEXT.md` tracks the current correctness rework, its remaining phases,
+and the known gaps. It sits in `notes/`, which is local-only and never
+committed. Update it when the branch state changes, and delete it once the
 rework is merged.

@@ -2,7 +2,7 @@
 
 This note records the design reasoning behind the restore rework. It comes from
 the 2026-11-04 architecture discussion that preceded M0–M5, and it is meant to
-outlive the branch-scoped notes in `CONTEXT.md`.
+outlive the branch-scoped notes in `notes/CONTEXT.md`.
 
 The implementation is authoritative. Read this for the shape and the
 invariants, then inspect `src/session_manager/restore.py` for the current
@@ -70,9 +70,12 @@ function names.
 1. **Placement is asserted, never inferred.** Every restored window is moved to
    its saved workspace by `con_id`. No phase may rely on which workspace happens
    to be focused when the window maps.
-2. **Visibility is asserted, never inferred.** A hidden scratchpad entry is only
-   ever parked with `move scratchpad`, never `scratchpad show`, and the result
-   is verified.
+2. **Visibility is asserted, never inferred.** A `hidden_scratchpad` entry is
+   only ever parked with `move scratchpad`, never `scratchpad show`, and the
+   park is verified. A window saved visible on a workspace with a non-`none`
+   `scratchpad_state` is deliberately re-shown instead: `move scratchpad` and
+   `scratchpad show`, then geometry and fullscreen (`restore.py:1524-1531`).
+   That path has no test of its own; the `hidden_scratchpad` park does.
 3. **Every phase is idempotent.** Re-running arrange, decorate, or reconcile
    converges; it never duplicates or toggles.
 4. **Failures are per-window.** One bad node is dropped and reported; it never
@@ -113,8 +116,8 @@ function names.
 
 ## Open gaps
 
-`CONTEXT.md` tracks the current list while the rework branch is open. The
-longer-lived gaps worth remembering are:
+`notes/CONTEXT.md` tracks the current list while the rework branch is open; these
+entries restate the longer-lived gaps worth remembering after it is deleted:
 
 - Reconcile repairs workspace placement, not nesting. The container shape is
   still rebuilt by the walk.
@@ -124,6 +127,13 @@ longer-lived gaps worth remembering are:
 - Floating geometry is verified and reapplied on Sway. i3 reports the frame
   rect, so the requested size cannot be compared with the live rect there.
 - `background_apps` is written to both the main state file and a sidecar.
+- The payload is still dict-based at the node level; `Snapshot` is typed only
+  at the top level.
+- `_park_in_scratchpad` still polls at 0.05s between its verification
+  attempts, and `apps/helium.py` waits 0.6s after a `--new-window` launch
+  without an observable condition.
+- `config.py` computes `BACKEND`, `STATE_FILE`, and related paths at import
+  time.
 
 ## Origin
 
