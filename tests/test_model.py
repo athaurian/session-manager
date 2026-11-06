@@ -87,6 +87,37 @@ class TestSnapshotRepair(unittest.TestCase):
         self.assertNotIn("width", rect)
         self.assertEqual(rect["height"], 600)
 
+    def test_a_non_finite_rect_member_is_dropped(self):
+        """A saved rect can never put infinity into a compositor command."""
+        win = make_window(
+            "kitty", rect={"x": 0, "y": 0, "width": float("inf"), "height": 600}
+        )
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertNotIn("width", snapshot.workspaces[0]["nodes"][0]["rect"])
+
+    def test_a_null_rect_member_is_dropped(self):
+        win = make_window(
+            "kitty", rect={"x": None, "y": 0, "width": 800, "height": 600}
+        )
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertNotIn("x", snapshot.workspaces[0]["nodes"][0]["rect"])
+
+    def test_invalid_marks_are_dropped(self):
+        win = make_window("kitty", marks=[42, "keep"])
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertEqual(snapshot.workspaces[0]["nodes"][0]["marks"], ["keep"])
+        self.assertTrue(snapshot.issues)
+
+    def test_a_non_finite_percent_is_dropped(self):
+        win = make_window("kitty", percent=float("nan"))
+        ws = make_workspace("1", nodes=[win])
+        snapshot = Snapshot.from_payload({"workspaces": [ws]})
+        self.assertNotIn("percent", snapshot.workspaces[0]["nodes"][0])
+        self.assertTrue(snapshot.issues)
+
     def test_missing_layout_defaults_to_splith(self):
         ws = make_workspace("1")
         del ws["layout"]

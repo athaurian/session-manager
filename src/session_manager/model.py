@@ -30,14 +30,17 @@ class StateValidationError(ValueError):
     """Raised when a payload cannot be read as a session at all."""
 
 
-def _is_number(value: Any) -> bool:
-    """Report whether a value is a real number, not a bool."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def _is_finite(value: Any) -> bool:
-    """Report whether a value is a finite number."""
-    return _is_number(value) and math.isfinite(float(value))
+    """Report whether a value is a finite number.
+
+    Booleans are not numbers here: `True` is an `int` in Python, and a
+    malformed state file must not be able to smuggle one through.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _clean_rect(rect: Any, path: str, issues: list[str]) -> dict[str, Any] | None:
@@ -126,9 +129,6 @@ def _clean_node(node: Any, path: str, issues: list[str]) -> dict[str, Any] | Non
         if name in RESERVED_WORKSPACE_NAMES:
             issues.append(f"{path}.name {name!r} is reserved; dropped")
             return None
-        if "output" in cleaned and not isinstance(cleaned["output"], str):
-            issues.append(f"{path}.output must be a string; dropped")
-            cleaned.pop("output", None)
 
     if not isinstance(cleaned.get("layout"), str):
         issues.append(f"{path}.layout must be a string; using splith")
@@ -181,6 +181,11 @@ class Snapshot:
             raw_background: Any = None
             raw_focused: Any = None
         elif isinstance(payload, dict):
+            # A payload without a version is a hand-edited or truncated file
+            # rather than one this project ever wrote: `save_session` always
+            # emits `to_payload`'s explicit version. Such a file is read as
+            # the version it was most likely saved as instead of being
+            # refused, and every node in it is still repaired below.
             raw_version = payload.get("version", 2)
             if not isinstance(raw_version, int) or isinstance(raw_version, bool):
                 raise StateValidationError("version must be an integer")
