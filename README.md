@@ -135,9 +135,10 @@ i3 and is not supported.
 - Terminals with their working directories, including Neovim sessions inside
   them.
 - Open documents, down to the page of the PDF you were reading in zathura.
-- The browser, relaunched with Helium's `--restore-last-session` flag. A
-  running instance is reused, missing windows are added, and the windows are
-  matched back to the saved ones.
+- The browser. A full restore relaunches Helium with `--restore-last-session`,
+  reuses a running instance when it has enough windows, and matches windows
+  back to the saved ones by title. A scoped `--workspace` restore opens blank
+  windows instead, because the browser does not expose its URLs.
 - Background apps that live in the tray with no visible window, such as a
   minimized Vesktop.
 

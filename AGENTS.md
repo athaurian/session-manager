@@ -87,8 +87,8 @@ make bench
 
 `make check` runs lint, format check, type check, and unit tests. `make
 integration` and `make bench` require Docker and do not run in CI. The CI
-workflow uses Python 3.13. The Make targets fetch pinned `ruff` and `mypy`
-through `uv`, so no project virtual environment is required.
+workflow tests Python 3.11 and 3.13. The Make targets fetch pinned `ruff` and
+`mypy` through `uv`, so no project virtual environment is required.
 
 ## Important constraints
 
@@ -108,8 +108,10 @@ through `uv`, so no project virtual environment is required.
   before a save can be missing from `--restore-last-session`.
 - The dropdown terminal is saved but does not count as restorable content;
   transient helper terminals are not saved.
-- Helium restores through `--restore-last-session` and matches windows by
-  title. A running instance is reused when it already has enough windows.
+- A full Helium restore uses `--restore-last-session` and matches windows by
+  title. A running instance is reused when it already has enough windows. A
+  scoped `--workspace` restore opens blank windows because the browser does
+  not expose its URLs to the compositor.
 
 ## Known debt
 
