@@ -171,21 +171,22 @@ class TestApplyEnv(EnvTestCase):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(PATH="/usr/bin")
-        self.assertTrue(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
         self.assertEqual(os.environ["DISPLAY"], ":0")
 
     def test_apply_repairs_an_empty_variable(self):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(DISPLAY="")
-        self.assertTrue(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
         self.assertEqual(os.environ["DISPLAY"], ":0")
 
-    def test_apply_reports_no_change_when_nothing_is_missing(self):
+    def test_apply_keeps_a_variable_that_is_already_set(self):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(DISPLAY=":0")
-        self.assertFalse(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
+        self.assertEqual(os.environ["DISPLAY"], ":0")
 
 
 class TestParsing(EnvTestCase):

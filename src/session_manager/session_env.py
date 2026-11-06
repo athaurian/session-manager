@@ -188,15 +188,12 @@ def compositor_env() -> dict[str, str]:
     return env
 
 
-def apply_compositor_env() -> bool:
+def apply_compositor_env() -> None:
     """Add the compositor's display variables to this process's environment.
 
     Every app the restore launches inherits os.environ, so filling the gaps
-    once here covers all of them. Return True when something was added.
+    once here covers all of them.
     """
-    changed = False
     for key, value in compositor_env().items():
         if value and not os.environ.get(key):
             os.environ[key] = value
-            changed = True
-    return changed

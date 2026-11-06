@@ -47,7 +47,7 @@ def notify(msg: str, *, timeout_ms: int = 3000, urgency: str = "low") -> None:
     except subprocess.TimeoutExpired:
         log.debug("notify-send timed out")
         return
-    except (OSError, TypeError, ValueError) as exc:
+    except OSError as exc:
         log.debug("notify-send failed: %s", exc)
         return
     nid = result.stdout.strip()
