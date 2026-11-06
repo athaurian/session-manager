@@ -215,6 +215,112 @@ class TestRequests(unittest.TestCase):
             conn.get_tree()
 
 
+class FakeSocket:
+    """A socket stand-in whose writes can stall, fail, or stop early."""
+
+    def __init__(self, sent_per_call=None, error=None):
+        self.sent_per_call = sent_per_call
+        self.error = error
+        self.written = b""
+        self.calls = 0
+
+    def send(self, data):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.sent_per_call is None:
+            # The peer is gone, so nothing is accepted.
+            return 0
+        count = min(self.sent_per_call, len(data))
+        self.written += data[:count]
+        return count
+
+    def shutdown(self, _how):
+        return None
+
+    def close(self):
+        return None
+
+
+class TestWriteDeadlines(unittest.TestCase):
+    """A write must not block forever when the compositor stopped reading.
+
+    A read may be told to wait forever, but a write never may: a compositor
+    that stopped reading must not block the manager.
+    """
+
+    def _connection(self, sock, request_timeout=0.05):
+        conn = IpcConnection(
+            sock_path="/tmp/unused.sock", request_timeout=request_timeout
+        )
+        conn._sock = sock
+        self.addCleanup(conn.close)
+        return conn
+
+    def _writable(self, sock):
+        """Pretend the socket can be written to."""
+        return unittest.mock.patch.object(
+            ipc_mod.select, "select", lambda *_args: ([], [sock], [])
+        )
+
+    def test_a_write_that_cannot_proceed_times_out(self):
+        sock = FakeSocket()
+        conn = self._connection(sock)
+        with (
+            unittest.mock.patch.object(
+                ipc_mod.select, "select", return_value=([], [], [])
+            ),
+            self.assertRaises(IpcError) as raised,
+        ):
+            conn._send(MSG_GET_TREE)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertEqual(sock.calls, 0)
+
+    def test_the_write_deadline_expires_even_on_a_writable_socket(self):
+        """A peer that accepts a byte at a time must still hit the deadline."""
+        sock = FakeSocket(sent_per_call=1)
+        conn = self._connection(sock, request_timeout=0.05)
+        clock = [0.0]
+
+        def fake_monotonic():
+            clock[0] += 0.03
+            return clock[0]
+
+        with (
+            self._writable(sock),
+            unittest.mock.patch.object(ipc_mod.time, "monotonic", fake_monotonic),
+            self.assertRaises(IpcError) as raised,
+        ):
+            conn._send(MSG_RUN_COMMAND, "x" * 100)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreater(sock.calls, 0)
+
+    def test_a_partial_write_is_resumed(self):
+        """A short write must not truncate the message."""
+        sock = FakeSocket(sent_per_call=3)
+        conn = self._connection(sock)
+        with self._writable(sock):
+            conn._send(MSG_RUN_COMMAND, "hello")
+        body = b"hello"
+        self.assertEqual(
+            sock.written, HEADER.pack(MAGIC, len(body), MSG_RUN_COMMAND) + body
+        )
+
+    def test_a_closed_peer_is_an_ipc_error(self):
+        sock = FakeSocket()
+        conn = self._connection(sock)
+        with self._writable(sock), self.assertRaises(IpcError) as raised:
+            conn._send(MSG_GET_TREE)
+        self.assertIn("closed", str(raised.exception))
+
+    def test_a_failed_send_is_an_ipc_error(self):
+        sock = FakeSocket(error=OSError("broken pipe"))
+        conn = self._connection(sock)
+        with self._writable(sock), self.assertRaises(IpcError) as raised:
+            conn._send(MSG_GET_TREE)
+        self.assertIn("closed", str(raised.exception))
+
+
 class TestWindowEventWatcher(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -141,6 +141,14 @@ class TestRestoreBackgroundApps(unittest.TestCase):
                 bg_mod.restore_background_apps(None, cache=FakeCache())
         self.assertEqual(self.popen_calls, [])
 
+    def test_non_utf8_sidecar_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "background.json"
+            sidecar.write_bytes(b"\xff")
+            with unittest.mock.patch.object(bg_mod, "BACKGROUND_APPS_FILE", sidecar):
+                bg_mod.restore_background_apps(None, cache=FakeCache())
+        self.assertEqual(self.popen_calls, [])
+
     def test_non_list_sidecar_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             sidecar = Path(tmp) / "background.json"

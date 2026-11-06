@@ -54,6 +54,34 @@ class TestClaimedWindows(RegistryTestCase):
         self.assertEqual(len(claims), 0)
 
 
+class TestRegistryFailures(RegistryTestCase):
+    """A launch unit that raises must still release the nodes waiting on it."""
+
+    def test_a_failing_unit_releases_its_nodes(self):
+        ctx = self.make_context()
+        node = make_window("kitty")
+
+        def boom():
+            raise RuntimeError("launch failed")
+
+        done = ctx.registry.submit([node], boom)
+        self.assertTrue(done.wait(timeout=5.0))
+        # The node was never given an id, so it counts as unmaterialized
+        # instead of the restore waiting for it forever.
+        self.assertIsNone(ctx.registry.resolve(node))
+
+    def test_a_failing_unit_is_logged_not_raised(self):
+        ctx = self.make_context()
+        node = make_window("kitty")
+
+        def boom():
+            raise RuntimeError("launch failed")
+
+        with self.assertLogs("session_manager", level="ERROR"):
+            done = ctx.registry.submit([node], boom)
+            self.assertTrue(done.wait(timeout=5.0))
+
+
 class TestLaunchUnits(RegistryTestCase):
     def test_pid_matched_windows_get_their_own_unit(self):
         units = restore_mod._launch_units([make_window("kitty"), make_window("kitty")])

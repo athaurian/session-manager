@@ -212,7 +212,9 @@ class TestExitCodes(unittest.TestCase):
         self.assertIn("Live vs Saved diff", stdout)
 
     def test_a_timeout_does_not_produce_a_traceback(self):
+        self.state_file.write_text(json.dumps({"workspaces": []}), encoding="utf-8")
         with (
+            unittest.mock.patch.object(restore_mod, "STATE_FILE", self.state_file),
             unittest.mock.patch.object(restore_mod, "apply_compositor_env"),
             unittest.mock.patch.object(restore_mod, "notify"),
             unittest.mock.patch.object(
@@ -236,6 +238,10 @@ class TestRestoreFailsFast(unittest.TestCase):
         patch = unittest.mock.patch.object(restore_mod, "STATE_FILE", state_file)
         patch.start()
         self.addCleanup(patch.stop)
+        # The test must never look for the developer's live compositor socket.
+        env_patch = unittest.mock.patch.object(restore_mod, "apply_compositor_env")
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def test_no_window_is_restored_when_the_compositor_is_unreachable(self):
         with (
