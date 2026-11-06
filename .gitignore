@@ -12,3 +12,6 @@ uv.lock
 dist/
 build/
 *.egg-info/
+# Agent-facing working notes: scratch state for one branch, not project
+# documentation. They stay local and are never committed.
+notes/
