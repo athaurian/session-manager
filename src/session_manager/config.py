@@ -147,12 +147,6 @@ APP_PROFILES: dict[str, AppProfile] = {
         "timeout": 15.0,
         "singleton": False,
     },
-    "mpv": {
-        "settle": 0.3,
-        "reject_floating": False,
-        "timeout": 15.0,
-        "singleton": False,
-    },
     "org.pwmt.zathura": {
         # A large PDF can take tens of seconds to map its window on a cold
         # cache. The wait ends as soon as the window appears or the process
@@ -204,17 +198,12 @@ HELIUM_ASSIGNMENT_TIMEOUT = 5.0
 HELIUM_WINDOW_STALL_TIMEOUT = 3.0
 
 APP_ID_COMMANDS: dict[str, str] = {
-    "helium": "helium-browser",
     "vesktop": "vesktop",
-    "thunar": "thunar",
-    "mpv": "mpv",
     "blueman-manager": "blueman-manager",
     "pavucontrol": "pavucontrol",
     # Qt5 wrapper desktop entry, which pins qt5ct.
     "org.keepassxc.KeePassXC": "gtk-launch org.keepassxc.KeePassXC",
-    "org.pwmt.zathura": "zathura",
     "calibre-gui": "calibre",
-    "calibre-ebook-viewer": "ebook-viewer",
 }
 
 # X11 exposes only WM_CLASS (class/instance), while Wayland apps have an
@@ -251,6 +240,11 @@ def canonical_app_id(value: str) -> str:
 # window manager's `for_window` rule keys on. Both the launcher and the save-side
 # classifier share it so a restored drop terminal stays recognisable.
 DROP_TERMINAL_INSTANCE = "scratchpad_term"
+
+# The mark the drop terminal window carries. It shares its value with the
+# title, but it is a separate fact: the compositor's `for_window` rule and
+# the save-side classifier read them from different places.
+DROP_TERMINAL_MARK = "drop_term"
 
 # Titles the transient helper terminals use. They come and go on their own, so
 # saving them would resurrect scratch helpers on the next restore.
