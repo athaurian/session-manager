@@ -32,7 +32,7 @@ class CreateSnapshotTestCase(unittest.TestCase):
             ) as cleanup,
         ):
             outcome = snapshot_mod.create_manager_snapshot(
-                "/tmp/nvim.sock", self.snapshot, 123
+                "/tmp/nvim.sock", self.snapshot
             )
         return outcome, rpc, cleanup
 
