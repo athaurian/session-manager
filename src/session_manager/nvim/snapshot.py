@@ -29,7 +29,6 @@ def snacks_sidecar_path(snapshot_path: Path) -> Path:
 def create_manager_snapshot(
     server_path: str,
     snapshot_path: Path,
-    nvim_pid: int | None,
 ) -> tuple[bool, str | None]:
     """Write a manager-owned Neovim session snapshot.
 

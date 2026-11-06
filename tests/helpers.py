@@ -14,13 +14,12 @@ class FakeWatcher:
     """Context manager that stands in for ``WindowEventWatcher``."""
 
     def __init__(self, *_args, **_kwargs):
-        self.closed = False
+        pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_exc):
-        self.closed = True
         return False
 
 

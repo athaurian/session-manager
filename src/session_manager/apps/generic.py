@@ -12,6 +12,7 @@ from pathlib import Path
 from ..config import (
     APP_ID_COMMANDS,
     APP_PROFILES,
+    APP_WAIT_TIMEOUT,
     DEFAULT_APP_PROFILE,
     WINDOW_SETTLE_POLL_INTERVAL,
     WINDOW_TREE_SCAN_INTERVAL,
@@ -29,16 +30,6 @@ from ..ipc import (
 from ._common import reap_if_needed
 
 log = logging.getLogger("session_manager")
-
-__all__ = [
-    "find_unclaimed_window",
-    "get_cmd_from_app_id",
-    "launch_and_get_id",
-    "launch_generic",
-    "matching_window_ids",
-    "wait_for_app_window",
-    "wait_for_window_by_pid",
-]
 
 
 def _desktop_entry(candidate: str) -> str:
@@ -79,7 +70,7 @@ def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
     # launcher; only the fallback handler starts from a command.
     from .handlers import handler_for
 
-    if handler_for(canonical).launch is not launch_generic:
+    if handler_for(canonical).dedicated:
         return None
     cmd = APP_ID_COMMANDS.get(canonical)
     if cmd:
@@ -121,11 +112,8 @@ def _process_exited(process: object | None) -> bool:
     """Report whether a launched process has exited."""
     if process is None:
         return False
-    poll = getattr(process, "poll", None)
-    if not callable(poll):
-        return False
     try:
-        return poll() is not None
+        return process.poll() is not None  # type: ignore[attr-defined]
     except OSError:
         return True
 
@@ -135,9 +123,9 @@ def wait_for_app_window(
     class_name: str,
     watcher: WindowEventWatcher,
     *,
-    settle: float = 0.3,
-    reject_floating: bool = False,
-    timeout: float = 20.0,
+    settle: float = DEFAULT_APP_PROFILE["settle"],
+    reject_floating: bool = DEFAULT_APP_PROFILE["reject_floating"],
+    timeout: float = DEFAULT_APP_PROFILE["timeout"],
     baseline_ids: set[int] | None = None,
     claimed_ids: MutableSet[int] | None = None,
     process: object | None = None,
@@ -227,7 +215,7 @@ def wait_for_window_by_pid(
     pid: int,
     app_id: str,
     *,
-    timeout: float = 15.0,
+    timeout: float = APP_WAIT_TIMEOUT,
     process: object | None = None,
     fail_fast_on_exit: bool = False,
 ) -> int | None:

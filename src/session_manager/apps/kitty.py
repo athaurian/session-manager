@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..config import (
     DROP_TERMINAL_INSTANCE,
+    DROP_TERMINAL_MARK,
     DROP_TERMINAL_TITLE,
     NVIM_SESSION_DIR,
     TERMINAL_WAIT_TIMEOUT,
@@ -32,11 +33,12 @@ log = logging.getLogger("session_manager")
 
 # The drop terminal is identified by any of its WM_CLASS instance, window name,
 # or mark, because each window manager surfaces a different subset of them.
-_TRANSIENT_KITTY_TITLES = frozenset(TRANSIENT_TERMINAL_TITLES)
-_TRANSIENT_KITTY_INSTANCES = frozenset(TRANSIENT_TERMINAL_TITLES)
-_DROP_KITTY_MARK = "drop_term"
+# The transient helper terminals share one set of names: a title, an instance,
+# and a mark all name the same few helpers.
+_TRANSIENT_KITTY_NAMES = frozenset(TRANSIENT_TERMINAL_TITLES)
 _DROP_KITTY_TITLE = DROP_TERMINAL_TITLE
 _DROP_KITTY_INSTANCE = DROP_TERMINAL_INSTANCE
+_DROP_KITTY_MARK = DROP_TERMINAL_MARK
 
 
 def _legacy_session_file(cwd: str) -> str:
@@ -55,9 +57,9 @@ def classify_kitty(node: dict, app_id: str) -> str | None:
     marks = node.get("marks") or []
 
     if (
-        title in _TRANSIENT_KITTY_TITLES
-        or instance in _TRANSIENT_KITTY_INSTANCES
-        or any(mark in _TRANSIENT_KITTY_INSTANCES for mark in marks)
+        title in _TRANSIENT_KITTY_NAMES
+        or instance in _TRANSIENT_KITTY_NAMES
+        or any(mark in _TRANSIENT_KITTY_NAMES for mark in marks)
     ):
         return None
 
@@ -104,9 +106,7 @@ def capture_kitty(_source: dict, pid: int, cache: ProcCache) -> dict[str, object
                 if nvim_server_pid is not None
                 else ""
             )
-            ok, err = create_manager_snapshot(
-                server_path, snapshot_path, nvim_server_pid
-            )
+            ok, err = create_manager_snapshot(server_path, snapshot_path)
             if ok and snapshot_path.exists():
                 info["nvim_type"] = "session"
                 info["nvim_snapshot"] = str(snapshot_path)

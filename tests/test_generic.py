@@ -3,15 +3,13 @@
 import tempfile
 import unittest
 import unittest.mock
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import session_manager.apps.calibre as calibre_mod
 import session_manager.apps.generic as gen_mod
-import session_manager.apps.kitty as kitty_mod
-import session_manager.apps.mpv as mpv_mod
-import session_manager.apps.thunar as thunar_mod
-import session_manager.apps.zathura as zathura_mod
+import session_manager.apps.handlers as handlers_mod
+from session_manager.apps.handlers import handler_for
 from tests.helpers import FakeWatcher, RecordingPopen
 
 
@@ -294,19 +292,24 @@ class TestWaitForAppWindow(unittest.TestCase):
 
 class TestLaunchDispatch(unittest.TestCase):
     def test_dedicated_launchers_are_used(self):
-        cases = [
-            ("kitty", kitty_mod, "launch_kitty"),
-            ("kitty_drop", kitty_mod, "launch_kitty_drop"),
-            ("zathura", zathura_mod, "launch_zathura"),
-            ("calibre-ebook-viewer", calibre_mod, "launch_ebook_viewer"),
-            ("thunar", thunar_mod, "launch_thunar"),
-            ("mpv", mpv_mod, "launch_mpv"),
-        ]
-        for app_id, module, name in cases:
+        for app_id in (
+            "kitty",
+            "kitty_drop",
+            "org.pwmt.zathura",
+            "calibre-ebook-viewer",
+            "thunar",
+            "mpv",
+        ):
             with self.subTest(app_id=app_id):
+                # The handler table holds the launcher, so substituting one
+                # means substituting the table entry it is recorded in.
+                launcher = unittest.mock.Mock(return_value=11)
+                entry = replace(handler_for(app_id), launch=launcher)
                 with unittest.mock.patch.object(
-                    module, name, return_value=11
-                ) as launcher:
+                    handlers_mod,
+                    "_TABLE",
+                    {**handlers_mod._TABLE, app_id: entry},
+                ):
                     result = gen_mod.launch_and_get_id(
                         {"app_id": app_id}, claimed_ids=set()
                     )

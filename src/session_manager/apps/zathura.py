@@ -17,9 +17,14 @@ from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
 
 
+def _dbus_name(pid: int) -> str:
+    """Return the D-Bus name a zathura instance registers for its pid."""
+    return f"org.pwmt.zathura.PID-{pid}"
+
+
 def get_zathura_info(pid: int) -> tuple[str, int]:
     """Return the document path and page number for a zathura window."""
-    bus_name = f"org.pwmt.zathura.PID-{pid}"
+    bus_name = _dbus_name(pid)
     doc_path, page_num = "", 0
     try:
         r = subprocess.run(
@@ -117,7 +122,7 @@ def launch_zathura(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     if page_num and document:
         # D-Bus name is only registered after the document loads. Poll the
         # bus instead of sleeping blindly.
-        bus_name = f"org.pwmt.zathura.PID-{proc.pid}"
+        bus_name = _dbus_name(proc.pid)
         deadline = time.monotonic() + ZATHURA_GOTO_PAGE_DEADLINE
         while time.monotonic() < deadline:
             r = subprocess.run(

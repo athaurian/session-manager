@@ -30,22 +30,17 @@ class ScriptedWatcher:
 
     def __init__(self, events):
         self.events = list(events)
-        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self.close()
         return False
 
     def get(self, timeout):
         if self.events:
             return self.events.pop(0)
         return None
-
-    def close(self):
-        self.closed = True
 
 
 def ev(change, cid, app_id="helium", name=""):
@@ -160,12 +155,23 @@ class TestHeliumAssignment(HeliumTestCase):
 
     def test_tree_scan_fallback_matches_titles(self):
         """If title events are missed, the periodic tree scan still assigns."""
-        saved = [make_window("helium", name="Only Tab")]
-        self.watcher_events = [ev("new", 31, name="")]
-        self._populate_on_launch([helium_node(31, "Only Tab")])
+        saved = [
+            make_window("helium", name="Tab A"),
+            make_window("helium", name="Tab B"),
+        ]
+        # Only the first window reports a title event; the second is never
+        # announced, so its title comes from the periodic tree scan.
+        self.watcher_events = [ev("new", 11, name="Tab A")]
+        # The live tree lists both windows in the opposite order, so a
+        # positional assignment would swap them.
+        self._populate_on_launch([helium_node(12, "Tab B"), helium_node(11, "Tab A")])
 
-        ctx, _ = self.run_group(saved)
-        self.assertEqual(ctx.helium_restored_ids, [31])
+        profile = helium_mod.APP_PROFILES["helium"]
+        # The scan fires 0.25 s after the launch; a deadline just past it
+        # lets the scan run while the test stays fast.
+        with unittest.mock.patch.dict(profile, {"timeout": 0.3}):
+            ctx, _ = self.run_group(saved)
+        self.assertEqual(ctx.helium_restored_ids, [11, 12])
 
     def test_close_event_drops_unassigned_window(self):
         saved = [make_window("helium", name="Tab A")]
