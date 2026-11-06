@@ -80,7 +80,7 @@ To check whether there is anything to restore without changing the desktop:
 | `save`        | Writes the current desktop to the saved session.                                                                                         |
 | `restore`     | Recreates the saved session on the running desktop.                                                                                      |
 | `has-session` | Exits 0 when the saved session contains anything worth restoring, and 1 otherwise. A login prompt can use this to decide whether to ask. |
-| `diff`        | Prints a plain-English comparison of the live windows and the saved windows, workspace by workspace.                                     |
+| `diff`        | Prints the window counts of the live windows and the saved windows, workspace by workspace.                                              |
 
 | Option          | Applies to        | Effect                                                                                                         |
 | --------------- | ----------------- | -------------------------------------------------------------------------------------------------------------- |
@@ -102,6 +102,10 @@ Set `XDG_STATE_HOME` to keep the state somewhere else. The three previous
 saves are kept next to the state file as `.1`, `.2`, and `.3`, where `.1` is
 the most recent.
 
+- Background app compatibility output: `sway_session_background_apps.json`,
+  `i3_session_background_apps.json`. `restore` reads these only when the main
+  state file was written before it carried the `background_apps` list.
+
 ## Supported window managers
 
 The tool looks for `SWAYSOCK` or `I3SOCK` first, then for the compositor name
@@ -112,6 +116,10 @@ Set `SESSION_MANAGER_BACKEND` to `sway` or `i3` to force a backend, or
 `SESSION_MANAGER_SOCK` to pin the IPC socket. An explicit backend value wins
 over the detected signals. A compositor binary that supports
 `--get-socketpath` can also provide the socket path.
+
+Set `SWAY_SESSION_IPC_REQUEST_TIMEOUT` to change how long a single IPC
+request waits for a reply, in seconds (default `1.0`). Non-numeric,
+negative, and non-finite values fall back to the default.
 
 ## Running restore at login
 
@@ -144,9 +152,9 @@ i3 and is not supported.
 
 ### Non-restorables
 
-- The dropdown terminal (a hidden terminal summoned by a keybinding) is not
-  counted as saved content, because that keybinding spawns it whenever it is
-  missing.
+- The dropdown terminal (a hidden terminal summoned by a keybinding) is saved,
+  but does not count as restorable content, because that keybinding spawns it
+  whenever it is missing.
 - Transient helper terminals (short-lived terminals opened by scripts) are
   intentionally not saved.
 

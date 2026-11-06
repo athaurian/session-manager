@@ -13,7 +13,7 @@ PY_FILES := $(shell find src/session_manager tests -name '*.py') bin/session-man
 .PHONY: help check lint format test integration bench
 
 help:
-	@echo "  check       - Lint, type check, and run the test suite"
+	@echo "  check       - Lint, format-check, type check, and run the test suite"
 	@echo "  lint        - Lint and format-check without modifying files"
 	@echo "  format      - Apply ruff fixes and formatting"
 	@echo "  test        - Run the unit tests"
