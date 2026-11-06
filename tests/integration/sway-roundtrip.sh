@@ -46,27 +46,30 @@ echo "sway: $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.l
 
 # Wait on the compositor tree rather than on a fixed delay. The tree is the
 # source of truth for whether a window has mapped, moved, or gone away.
-wait_for_title() {
-    local title=$1
+# Foot does not keep the title from -T in Sway's tree, so the process id is
+# the stable identity for the helpers below.
+wait_for_pid() {
+    local pid=$1
     for _ in $(seq 1 100); do
-        if swaymsg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "window '$title' did not appear" >&2
-    return 1
-}
+        if swaymsg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
 
-wait_for_title_gone() {
-    local title=$1
-    for _ in $(seq 1 100); do
-        if ! swaymsg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
+def walk(node):
+    if node.get("pid") == pid:
+        return True
+    return any(
+        walk(child)
+        for child in node.get("nodes", []) + node.get("floating_nodes", [])
+    )
+
+sys.exit(0 if walk(json.load(sys.stdin)) else 1)
+' "$pid"; then
             return 0
         fi
         sleep 0.1
     done
-    echo "window '$title' did not disappear" >&2
+    echo "window with pid '$pid' did not appear" >&2
     return 1
 }
 
@@ -83,14 +86,14 @@ wait_for_app_gone() {
 }
 
 wait_for_floating() {
-    local title=$1
+    local pid=$1
     for _ in $(seq 1 100); do
         if swaymsg -t get_tree 2>/dev/null | python3 -c '
 import json, sys
-title = sys.argv[1]
+pid = int(sys.argv[1])
 
 def walk(node):
-    if node.get("type") == "floating_con" and node.get("name") == title:
+    if node.get("type") == "floating_con" and node.get("pid") == pid:
         return True
     return any(
         walk(child)
@@ -98,26 +101,26 @@ def walk(node):
     )
 
 sys.exit(0 if walk(json.load(sys.stdin)) else 1)
-' "$title"; then
+' "$pid"; then
             return 0
         fi
         sleep 0.1
     done
-    echo "window '$title' did not float" >&2
+    echo "window with pid '$pid' did not float" >&2
     return 1
 }
 
 wait_for_rect_stable() {
-    local title=$1
+    local pid=$1
     local previous=""
     local current
     for _ in $(seq 1 100); do
         current=$(swaymsg -t get_tree 2>/dev/null | python3 -c '
 import json, sys
-title = sys.argv[1]
+pid = int(sys.argv[1])
 
 def find(node):
-    if node.get("name") == title:
+    if node.get("pid") == pid:
         return node.get("rect", {})
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
         found = find(child)
@@ -127,23 +130,61 @@ def find(node):
 
 rect = find(json.load(sys.stdin))
 print(json.dumps(rect, sort_keys=True) if rect is not None else "")
-' "$title" 2>/dev/null || true)
+' "$pid" 2>/dev/null || true)
         if [ -n "$current" ] && [ "$current" = "$previous" ]; then
             return 0
         fi
         previous=$current
         sleep 0.1
     done
-    echo "window '$title' geometry did not settle" >&2
+    echo "window with pid '$pid' geometry did not settle" >&2
+    return 1
+}
+
+wait_for_floating_rect_stable() {
+    local workspace=$1
+    local app_id=$2
+    local previous=""
+    local current
+    for _ in $(seq 1 100); do
+        current=$(swaymsg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+workspace, app_id = sys.argv[1], sys.argv[2]
+
+def find(node, current_workspace=None):
+    if node.get("type") == "workspace":
+        current_workspace = node.get("name")
+    if (
+        node.get("type") == "floating_con"
+        and node.get("app_id") == app_id
+        and current_workspace == workspace
+    ):
+        return node.get("rect", {})
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        found = find(child, current_workspace)
+        if found is not None:
+            return found
+    return None
+
+rect = find(json.load(sys.stdin))
+print(json.dumps(rect, sort_keys=True) if rect is not None else "")
+' "$workspace" "$app_id" 2>/dev/null || true)
+        if [ -n "$current" ] && [ "$current" = "$previous" ]; then
+            return 0
+        fi
+        previous=$current
+        sleep 0.1
+    done
+    echo "floating '$app_id' on workspace '$workspace' did not settle" >&2
     return 1
 }
 
 wait_for_scratchpad() {
-    local title=$1
+    local pid=$1
     for _ in $(seq 1 100); do
         if swaymsg -t get_tree 2>/dev/null | python3 -c '
 import json, sys
-title = sys.argv[1]
+pid = int(sys.argv[1])
 
 def find_scratchpad(node):
     if node.get("name") == "__i3_scratch":
@@ -154,22 +195,22 @@ def find_scratchpad(node):
             return found
     return None
 
-def has_title(node):
-    if node.get("name") == title:
+def has_pid(node):
+    if node.get("pid") == pid:
         return True
     return any(
-        has_title(child)
+        has_pid(child)
         for child in node.get("nodes", []) + node.get("floating_nodes", [])
     )
 
 scratchpad = find_scratchpad(json.load(sys.stdin))
-sys.exit(0 if scratchpad and has_title(scratchpad) else 1)
-' "$title"; then
+sys.exit(0 if scratchpad and has_pid(scratchpad) else 1)
+' "$pid"; then
             return 0
         fi
         sleep 0.1
     done
-    echo "window '$title' did not move to the scratchpad" >&2
+    echo "window with pid '$pid' did not move to the scratchpad" >&2
     return 1
 }
 
@@ -189,33 +230,49 @@ verify_restored() {
     return 1
 }
 
+restore_without_failures() {
+    local output
+    output=$(python3 -m session_manager restore --quiet 2>&1)
+    if grep -Fq "Partial restore failures:" <<<"$output" \
+        || grep -Fq "Windows not restored:" <<<"$output"; then
+        echo "$output" >&2
+        echo "restore reported missing or partial windows" >&2
+        return 1
+    fi
+}
+
 # Workspace 1 gets three tiled terminals in a nested split. Workspace 2 gets
 # a floating one. The nested shape is what the arrangement walk has to
 # reproduce after the windows are materialized concurrently.
 swaymsg 'workspace 1' >/dev/null
 foot -T alpha -e sleep 600 >/tmp/foot-alpha.log 2>&1 &
-wait_for_title alpha
+ALPHA_PID=$!
+wait_for_pid "$ALPHA_PID"
 foot -T beta -e sleep 600 >/tmp/foot-beta.log 2>&1 &
-wait_for_title beta
-swaymsg '[title="^beta$"] focus' >/dev/null
+BETA_PID=$!
+wait_for_pid "$BETA_PID"
+swaymsg "[pid=$BETA_PID] focus" >/dev/null
 swaymsg 'split v' >/dev/null
 foot -T gamma -e sleep 600 >/tmp/foot-gamma.log 2>&1 &
-wait_for_title gamma
+GAMMA_PID=$!
+wait_for_pid "$GAMMA_PID"
 swaymsg 'workspace 2' >/dev/null
 foot -T delta -e sleep 600 >/tmp/foot-delta.log 2>&1 &
-wait_for_title delta
-swaymsg '[title="^delta$"] floating enable' >/dev/null
-wait_for_floating delta
-swaymsg '[title="^delta$"] resize set 600 400' >/dev/null
-swaymsg '[title="^delta$"] move position 100 100' >/dev/null
-wait_for_rect_stable delta
+DELTA_PID=$!
+wait_for_pid "$DELTA_PID"
+swaymsg "[pid=$DELTA_PID] floating enable" >/dev/null
+wait_for_floating "$DELTA_PID"
+swaymsg "[pid=$DELTA_PID] resize set 600 400" >/dev/null
+swaymsg "[pid=$DELTA_PID] move position 100 100" >/dev/null
+wait_for_rect_stable "$DELTA_PID"
 
 # A hidden scratchpad window must still be parked out of sight after restore.
 swaymsg 'workspace 1' >/dev/null
 foot -T epsilon -e sleep 600 >/tmp/foot-epsilon.log 2>&1 &
-wait_for_title epsilon
-swaymsg '[title="^epsilon$"] move scratchpad' >/dev/null
-wait_for_scratchpad epsilon
+EPSILON_PID=$!
+wait_for_pid "$EPSILON_PID"
+swaymsg "[pid=$EPSILON_PID] move scratchpad" >/dev/null
+wait_for_scratchpad "$EPSILON_PID"
 
 python3 -m session_manager save --quiet
 echo "saved sway state"
@@ -247,17 +304,19 @@ PY
 
 pkill -x foot 2>/dev/null || true
 wait_for_app_gone foot
-python3 -m session_manager restore --quiet
+restore_without_failures
+wait_for_floating_rect_stable 2 foot
 verify_restored "$XDG_STATE_HOME/sway_session.json"
 
 echo '--- restore with no WAYLAND_DISPLAY/SWAYSOCK ---'
 pkill -x foot 2>/dev/null || true
 wait_for_app_gone foot
 unset WAYLAND_DISPLAY SWAYSOCK I3SOCK DISPLAY
-python3 -m session_manager restore --quiet
+restore_without_failures
 SWAYSOCK=$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'sway-ipc.*.sock' | head -1)
 export SWAYSOCK
 export WAYLAND_DISPLAY=wayland-1
+wait_for_floating_rect_stable 2 foot
 verify_restored "$XDG_STATE_HOME/sway_session.json"
 
 echo 'PASS: sway roundtrip'

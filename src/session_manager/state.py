@@ -30,14 +30,21 @@ class RestoreContext:
     )
 
     def add_failure(self, message: str) -> None:
-        """Record a failure from any thread."""
+        """Record a failure from any thread.
+
+        One root cause can be hit from more than one place — a staging
+        workspace that cannot be focused is retried per workspace group, for
+        instance — so a repeat is dropped rather than counted twice.
+        """
         with self._lock:
-            self.failures.append(message)
+            if message not in self.failures:
+                self.failures.append(message)
 
     def add_missing(self, message: str) -> None:
         """Record a window that did not come back."""
         with self._lock:
-            self.missing.append(message)
+            if message not in self.missing:
+                self.missing.append(message)
 
     def discard_missing(self, message: str) -> None:
         """Forget a missing window that was recovered later in the run."""

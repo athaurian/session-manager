@@ -53,7 +53,20 @@ echo "i3: $(i3-msg -t get_version | python3 -c 'import json,sys; print(json.load
 wait_for_title() {
     local title=$1
     for _ in $(seq 1 100); do
-        if i3-msg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
+        if i3-msg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+title = sys.argv[1]
+
+def walk(node):
+    if node.get("name") == title:
+        return True
+    return any(
+        walk(child)
+        for child in node.get("nodes", []) + node.get("floating_nodes", [])
+    )
+
+sys.exit(0 if walk(json.load(sys.stdin)) else 1)
+' "$title"; then
             return 0
         fi
         sleep 0.1
@@ -65,7 +78,20 @@ wait_for_title() {
 wait_for_title_gone() {
     local title=$1
     for _ in $(seq 1 100); do
-        if ! i3-msg -t get_tree 2>/dev/null | grep -Fq "\"name\": \"$title\""; then
+        if ! i3-msg -t get_tree 2>/dev/null | python3 -c '
+import json, sys
+title = sys.argv[1]
+
+def walk(node):
+    if node.get("name") == title:
+        return True
+    return any(
+        walk(child)
+        for child in node.get("nodes", []) + node.get("floating_nodes", [])
+    )
+
+sys.exit(0 if walk(json.load(sys.stdin)) else 1)
+' "$title"; then
             return 0
         fi
         sleep 0.1
@@ -81,11 +107,14 @@ wait_for_floating() {
 import json, sys
 title = sys.argv[1]
 
-def walk(node):
-    if node.get("type") == "floating_con" and node.get("name") == title:
+# i3 wraps a floating window in a floating_con and keeps the title on the
+# child container, so the title has to be looked for inside the wrapper.
+def walk(node, floating=False):
+    floating = floating or node.get("type") == "floating_con"
+    if node.get("name") == title and floating:
         return True
     return any(
-        walk(child)
+        walk(child, floating)
         for child in node.get("nodes", []) + node.get("floating_nodes", [])
     )
 

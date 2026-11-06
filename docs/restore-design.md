@@ -59,7 +59,7 @@ implementation:
 - **Decorate** is folded into that walk: `_apply_marks`, `_apply_geometry`,
   `_apply_fullscreen`, `_apply_border`, and `_apply_percent` all address the
   window by id.
-- **Reconcile** is `_recover_staged_windows` followed by
+- **Reconcile** is `_recover_late_windows` followed by
   `_reconcile_placements`.
 
 ## Invariants
@@ -92,7 +92,14 @@ function names.
 6. Recover windows that mapped after their launch wait.
 7. Reconcile workspace placement and scratchpad visibility against the live
    tree.
-8. Leave the staging workspace only after it is empty.
+8. Keep staging focused and verify the saved floating geometry after the
+   application has settled. If the live rect or workspace has diverged,
+   always focus the saved workspace, reapply the geometry, and poll until the
+   expected rect and workspace are stable.
+9. Recover and reconcile once more while staging is still focused, so a
+   window that mapped during the geometry wait is not lost.
+10. Leave the staging workspaces only after they are empty, then restore the
+    requested destination focus.
 
 ## What we deliberately did not do
 
@@ -114,7 +121,8 @@ longer-lived gaps worth remembering are:
 - Adoption needs a pid or an exact title match. A relaunched app that renames
   its window is launched again rather than reused.
 - Scratchpad groups are flattened, so their internal layout is lost.
-- Floating geometry is applied once and not verified against the live rect.
+- Floating geometry is verified and reapplied on Sway. i3 reports the frame
+  rect, so the requested size cannot be compared with the live rect there.
 - `background_apps` is written to both the main state file and a sidecar.
 
 ## Origin

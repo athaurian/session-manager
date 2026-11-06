@@ -3,7 +3,10 @@ and floating-window restore branches."""
 
 import unittest
 import unittest.mock
+from typing import ClassVar
 
+import session_manager.restore as restore_mod
+from session_manager.state import RestoreContext
 from tests.helpers import (
     RestoreHarnessTestCase,
     make_con,
@@ -150,6 +153,25 @@ class TestRestoreNode(RestoreHarnessTestCase):
         self.assertCommand("mark foo")
         self.assertCommand("mark bar")
 
+    def test_arrangement_reads_the_tree_once_per_child_plus_the_root(self):
+        """One tree read answers both focus depth and placement."""
+        ws = make_workspace("1", nodes=[make_window("kitty"), make_window("kitty")])
+        tree = self._fake_get_tree()
+        reads = 0
+
+        def counted_tree():
+            nonlocal reads
+            reads += 1
+            return tree
+
+        ctx = self.restore_mod.RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", counted_tree):
+            self.restore_mod._restore_node(ws, ctx)
+        # The workspace root is read once, then each child gets one fresh
+        # read. Placement reuses that read instead of asking for another.
+        self.assertEqual(reads, 3)
+
 
 class TestRestoreFloating(RestoreHarnessTestCase):
     def _floating(self, node):
@@ -194,6 +216,29 @@ class TestRestoreFloating(RestoreHarnessTestCase):
     def test_non_fullscreen_floating_window(self):
         self._floating(make_window("kitty", fullscreen_mode=0))
         self.assertCommand("fullscreen disable")
+
+    def test_fullscreen_rerun_asserts_the_same_state(self):
+        """A rerun must not toggle an already-fullscreen window."""
+        self.restore_mod._apply_fullscreen(1000, 1)
+        self.restore_mod._apply_fullscreen(1000, 1)
+        self.assertEqual(
+            [call for call in self.calls if "fullscreen" in call],
+            [
+                "[con_id=1000] fullscreen enable",
+                "[con_id=1000] fullscreen enable",
+            ],
+        )
+
+        self.calls.clear()
+        self.restore_mod._apply_fullscreen(1000, 0)
+        self.restore_mod._apply_fullscreen(1000, 0)
+        self.assertEqual(
+            [call for call in self.calls if "fullscreen" in call],
+            [
+                "[con_id=1000] fullscreen disable",
+                "[con_id=1000] fullscreen disable",
+            ],
+        )
 
     def test_marks_applied_to_kitty_drop_floating(self):
         self._floating(make_window("kitty_drop", marks=["d"]))
@@ -324,7 +369,7 @@ class TestHeliumScratchpad(RestoreHarnessTestCase):
 
 
 class TestFocusedWorkspace(RestoreHarnessTestCase):
-    def _run_locked(self, payload, focused=None):
+    def _run_locked(self, payload, focused=None, extra_patches=()):
         """Runs _restore_session_locked against a temp state file."""
         import json
         import tempfile
@@ -350,6 +395,7 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
                 unittest.mock.patch.object(
                     self.restore_mod, "_start_helium_materialization"
                 ),
+                *extra_patches,
             ]
             for p in extra:
                 p.start()
@@ -394,6 +440,50 @@ class TestFocusedWorkspace(RestoreHarnessTestCase):
             if c.startswith("workspace ") and "_session_restore" not in c
         ]
         self.assertLess(switches.index("workspace 1"), switches.index("workspace 2"))
+
+    def test_geometry_is_verified_before_the_final_staging_sweep(self):
+        """A window that maps during the settle pass must still be recoverable."""
+        events: list[str] = []
+        payload = {
+            "workspaces": [make_workspace("1", nodes=[make_window("kitty")])],
+            "hidden_scratchpad": [],
+            "background_apps": [],
+        }
+        self._run_locked(
+            payload,
+            focused="1",
+            extra_patches=[
+                unittest.mock.patch.object(
+                    self.restore_mod,
+                    "_verify_floating_geometry",
+                    side_effect=lambda *_a, **_kw: events.append("verify"),
+                ),
+                unittest.mock.patch.object(
+                    self.restore_mod,
+                    "_finish_staging",
+                    side_effect=lambda *_a, **_kw: events.append("finish"),
+                ),
+            ],
+        )
+        self.assertEqual(events, ["verify", "finish"])
+
+    def test_a_geometry_failure_does_not_leave_focus_on_staging(self):
+        payload = {
+            "workspaces": [make_workspace("1", nodes=[make_window("kitty")])],
+            "hidden_scratchpad": [],
+            "background_apps": [],
+        }
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_verify_floating_geometry",
+                side_effect=RuntimeError("geometry failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "geometry failed"),
+        ):
+            self._run_locked(payload, focused="1")
+        switches = [c for c in self.calls if c.startswith("workspace ")]
+        self.assertEqual(switches[-1], "workspace 1")
 
     def test_invalid_session_file_skips_restore(self):
         import tempfile
@@ -596,6 +686,23 @@ class TestRestoreReporting(RestoreHarnessTestCase):
         }
         notifications = self._run_locked(payload)
         self.assertIn("you can safely move now", notifications[-1])
+
+
+class TestRestoreContext(RestoreHarnessTestCase):
+    def test_a_missing_window_is_only_reported_once(self):
+        ctx = RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        ctx.add_missing("alpha")
+        ctx.add_missing("alpha")
+        self.assertEqual(ctx.missing, ["alpha"])
+
+    def test_a_repeated_failure_is_only_reported_once(self):
+        """One root cause must not be counted once per attempt."""
+        ctx = RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        ctx.add_failure("could not focus staging workspace")
+        ctx.add_failure("could not focus staging workspace")
+        self.assertEqual(ctx.failures, ["could not focus staging workspace"])
 
 
 class TestBackgroundRestoreOrder(RestoreHarnessTestCase):
@@ -1154,7 +1261,7 @@ class TestReconcilePlacements(RestoreHarnessTestCase):
         self.assertEqual(self.calls, [])
 
 
-class TestRecoverStagedWindows(RestoreHarnessTestCase):
+class TestRecoverLateWindows(RestoreHarnessTestCase):
     """A window that maps after its launch wait is still placed."""
 
     def _ctx(self, *adopted):
@@ -1175,6 +1282,28 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                         {
                             "type": "workspace",
                             "name": self.restore_mod.RESTORE_STAGING_WORKSPACE,
+                            "nodes": list(windows),
+                            "floating_nodes": [],
+                        }
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def _target_tree(self, workspace, *windows):
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": workspace,
                             "nodes": list(windows),
                             "floating_nodes": [],
                         }
@@ -1210,12 +1339,40 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
             ),
         ):
-            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
 
         self.assertEqual(recovered, 1)
         self.assertEqual(ctx.missing, [])
         self.assertEqual(ctx.registry.resolve(win), 801)
         self.assertCommand("[con_id=801] move to workspace 7")
+
+    def test_late_window_on_a_restored_workspace_is_adopted(self):
+        """The geometry correction can briefly focus a restored workspace."""
+        win = make_window("calibre-gui", name="Library - calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx()
+        ctx.add_missing("Library - calibre")
+        tree = self._target_tree(
+            "7", self._live(806, "calibre-gui", "Library - calibre")
+        )
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree):
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(ctx.registry.resolve(win), 806)
+
+    def test_unmatched_window_on_a_restored_workspace_is_left_alone(self):
+        saved = make_window("kitty", name="alpha")
+        ws = make_workspace("7", nodes=[saved])
+        ctx = self._ctx((saved, 900))
+        tree = self._target_tree("7", self._live(807, "mpv", "video - mpv"))
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", lambda: tree):
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(ctx.failures, [])
+        self.assertFalse(any("move to workspace" in call for call in self.calls))
 
     def test_late_hidden_window_is_parked(self):
         from session_manager.config import SCRATCHPAD_WORKSPACE
@@ -1232,7 +1389,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 lambda _win_id: SCRATCHPAD_WORKSPACE,
             ),
         ):
-            recovered = self.restore_mod._recover_staged_windows([], [win], ctx)
+            recovered = self.restore_mod._recover_late_windows([], [win], ctx)
 
         self.assertEqual(recovered, 1)
         self.assertEqual(ctx.missing, [])
@@ -1253,7 +1410,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
             ),
         ):
-            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
 
         self.assertEqual(recovered, 0)
         self.assertTrue(
@@ -1276,7 +1433,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
             ),
         ):
-            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
 
         self.assertEqual(recovered, 0)
         self.assertFalse(ctx.registry.has(saved))
@@ -1295,7 +1452,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 lambda _win_id: self.restore_mod.RESTORE_STAGING_WORKSPACE,
             ),
         ):
-            recovered = self.restore_mod._recover_staged_windows([ws], [], ctx)
+            recovered = self.restore_mod._recover_late_windows([ws], [], ctx)
 
         self.assertEqual(recovered, 1)
         self.assertEqual(ctx.registry.resolve(saved), 805)
@@ -1309,7 +1466,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 side_effect=[["_session_restore"], []],
             ),
             unittest.mock.patch.object(
-                self.restore_mod, "_recover_staged_windows", return_value=1
+                self.restore_mod, "_recover_late_windows", return_value=1
             ) as recover,
             unittest.mock.patch.object(
                 self.restore_mod, "_reconcile_placements"
@@ -1325,6 +1482,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
     def test_finish_staging_sweeps_before_switching_away(self):
         """A window that maps during the sweep lands on staging, not the target."""
         ctx = self._ctx()
+        ws = make_workspace("1", nodes=[make_window("kitty")])
         calls_during_sweep: list[list[str]] = []
         with (
             unittest.mock.patch.object(
@@ -1334,17 +1492,17 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
             ),
             unittest.mock.patch.object(
                 self.restore_mod,
-                "_recover_staged_windows",
+                "_recover_late_windows",
                 side_effect=lambda *_a, **_kw: calls_during_sweep.append(
                     list(self.calls)
                 ),
             ),
             unittest.mock.patch.object(self.restore_mod, "_reconcile_placements"),
         ):
-            self.restore_mod._finish_staging([], [], ctx, "2")
+            self.restore_mod._finish_staging([ws], [], ctx, "2")
 
-        self.assertEqual(calls_during_sweep, [[]])
-        self.assertEqual(self.calls, ["workspace 2"])
+        self.assertEqual(calls_during_sweep, [["workspace _session_restore"]])
+        self.assertEqual(self.calls, ["workspace _session_restore", "workspace 2"])
 
     def test_finish_staging_reports_a_workspace_that_will_not_leave(self):
         ctx = self._ctx()
@@ -1355,7 +1513,7 @@ class TestRecoverStagedWindows(RestoreHarnessTestCase):
                 side_effect=[["_session_restore"], ["_session_restore"]],
             ),
             unittest.mock.patch.object(
-                self.restore_mod, "_recover_staged_windows", return_value=0
+                self.restore_mod, "_recover_late_windows", return_value=0
             ),
             unittest.mock.patch.object(self.restore_mod, "_reconcile_placements"),
         ):
@@ -1454,6 +1612,509 @@ class TestHiddenScratchpad(RestoreHarnessTestCase):
             any("vanished" in failure for failure in ctx.failures),
             ctx.failures,
         )
+
+
+class TreeSource:
+    """Serve a sequence of live trees, repeating the last one.
+
+    The verification pass reads the tree more than once: twice to settle the
+    target, then twice to confirm the reapplied geometry. The sequence lets
+    a test say what the compositor answers at each step.
+    """
+
+    def __init__(self, trees):
+        self.trees = list(trees)
+        self.calls = 0
+
+    def __call__(self):
+        index = min(self.calls, len(self.trees) - 1)
+        self.calls += 1
+        return self.trees[index]
+
+
+class TestFloatingGeometryVerification(RestoreHarnessTestCase):
+    """The saved floating geometry is checked against the live tree.
+
+    An application asks for its own size right after it maps, and that
+    request can land after the restore placed the window. The verification
+    pass reads the tree back once it has settled and applies the saved
+    geometry again when the window no longer matches it.
+    """
+
+    SAVED_RECT: ClassVar[dict] = {"x": 100, "y": 121, "width": 600, "height": 379}
+    LIVE_RECT: ClassVar[dict] = {"x": 100, "y": 121, "width": 704, "height": 502}
+    WIN_ID = 4242
+
+    def setUp(self):
+        super().setUp()
+        # The settle poll must not slow the suite down.
+        patch = unittest.mock.patch.object(
+            self.restore_mod, "_GEOMETRY_POLL_INTERVAL", 0
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        timeout_patch = unittest.mock.patch.object(
+            self.restore_mod, "_GEOMETRY_SETTLE_TIMEOUT", 0.05
+        )
+        timeout_patch.start()
+        self.addCleanup(timeout_patch.stop)
+        deco_patch = unittest.mock.patch.object(
+            self.restore_mod, "_live_deco_height", return_value=0
+        )
+        deco_patch.start()
+        self.addCleanup(deco_patch.stop)
+        origin_patch = unittest.mock.patch.object(
+            self.restore_mod, "_workspace_origin", return_value=(0, 0)
+        )
+        origin_patch.start()
+        self.addCleanup(origin_patch.stop)
+
+    def _live_tree(self, rect, workspace="2", node_type="floating_con"):
+        """Return a tree with one floating window at the given rect."""
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": workspace,
+                            "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                            "nodes": [],
+                            "floating_nodes": [
+                                {
+                                    "type": node_type,
+                                    "id": self.WIN_ID,
+                                    "app_id": "foot",
+                                    "rect": dict(rect),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def _context(self):
+        ctx = RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        return ctx
+
+    def _verify(self, trees, node, ctx):
+        """Run the verification pass against the given tree sequence."""
+        source = TreeSource(trees)
+        workspaces = [make_workspace("2", nodes=[], floating=[node])]
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", source):
+            self.restore_mod._verify_floating_geometry(workspaces, ctx)
+        return source
+
+    def _saved_window(self, **extra):
+        node = make_window("foot", rect=dict(self.SAVED_RECT))
+        node.update(extra)
+        return node
+
+    def test_a_divergent_rect_is_reapplied(self):
+        """The application overrode the size, so the saved one is applied again."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify(
+            [
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.SAVED_RECT),
+                self._live_tree(self.SAVED_RECT),
+            ],
+            node,
+            ctx,
+        )
+        self.assertTrue(
+            any("resize set width 600 px height 379 px" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertTrue(
+            any("move position 100 121" in c for c in self.calls), self.calls
+        )
+        # Sway applies `move position` in the focused workspace. The saved
+        # workspace is focused for the correction, then focus returns to
+        # staging so a late window can still be recovered.
+        workspace_index = self.calls.index("workspace 2")
+        resize_index = next(
+            i for i, call in enumerate(self.calls) if "resize set" in call
+        )
+        staging_index = (
+            len(self.calls) - 1 - self.calls[::-1].index("workspace _session_restore")
+        )
+        self.assertLess(workspace_index, resize_index)
+        self.assertGreater(staging_index, resize_index)
+
+    def test_a_matching_rect_is_reapplied_after_the_settle(self):
+        """A late application request cannot win before the final check."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify([self._live_tree(self.SAVED_RECT)], node, ctx)
+        self.assertTrue(
+            any("resize set width 600 px height 379 px" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_partial_saved_rect_uses_the_restore_defaults(self):
+        """Missing width and height use the same defaults as the first apply."""
+        ctx = self._context()
+        node = make_window("foot", rect={"x": 100, "y": 121})
+        ctx.registry.adopt(node, self.WIN_ID)
+        live_rect = {"x": 100, "y": 121, "width": 800, "height": 600}
+        self._verify(
+            [
+                self._live_tree(live_rect),
+                self._live_tree(live_rect),
+                self._live_tree(live_rect),
+                self._live_tree(live_rect),
+            ],
+            node,
+            ctx,
+        )
+        self.assertTrue(
+            any("resize set width 800 px height 600 px" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_tiled_window_is_not_resized_as_floating(self):
+        """A failed float must not turn into a tile resize."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        tree = self._live_tree(self.LIVE_RECT, node_type="con")
+        self._verify([tree], node, ctx)
+        self.assertFalse(any("resize set" in c for c in self.calls), self.calls)
+        self.assertTrue(
+            any("window is not floating" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_a_failed_workspace_switch_skips_the_geometry_correction(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+
+        def record(command):
+            self.calls.append(command)
+            return command != "workspace 2"
+
+        with unittest.mock.patch.object(self.restore_mod, "cmd", record):
+            self._verify(
+                [
+                    self._live_tree(self.LIVE_RECT),
+                    self._live_tree(self.LIVE_RECT),
+                ],
+                node,
+                ctx,
+            )
+        self.assertFalse(any("resize set" in c for c in self.calls), self.calls)
+        self.assertTrue(
+            any("could not focus workspace" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_a_dropped_connection_during_the_correction_is_reported(self):
+        """A transport failure costs one window, not the whole restore."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+
+        def failing(command):
+            self.calls.append(command)
+            if "resize set" in command:
+                raise OSError("connection dropped")
+            return True
+
+        with unittest.mock.patch.object(self.restore_mod, "cmd", failing):
+            self._verify(
+                [
+                    self._live_tree(self.LIVE_RECT),
+                    self._live_tree(self.LIVE_RECT),
+                ],
+                node,
+                ctx,
+            )
+        self.assertTrue(
+            any("connection dropped" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+        # The correction stopped for that window, but the pass still left
+        # staging focused and did not abort.
+        self.assertIn("workspace 2", self.calls)
+        self.assertEqual(
+            self.calls.count("workspace _session_restore"),
+            2,
+            self.calls,
+        )
+
+    def test_a_target_that_never_settles_is_reported(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        reads = 0
+
+        def changing_tree():
+            nonlocal reads
+            reads += 1
+            rect = dict(self.LIVE_RECT)
+            rect["width"] += reads
+            return self._live_tree(rect)
+
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", changing_tree):
+            self.restore_mod._verify_floating_geometry(
+                [make_workspace("2", nodes=[], floating=[node])], ctx
+            )
+        self.assertTrue(
+            any("did not settle" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+        self.assertFalse(any("resize set" in c for c in self.calls), self.calls)
+
+    def test_unrelated_layout_churn_does_not_delay_the_settle(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        reads = 0
+
+        def changing_tree():
+            nonlocal reads
+            reads += 1
+            rect = self.LIVE_RECT if reads <= 2 else self.SAVED_RECT
+            tree = self._live_tree(rect)
+            tree["nodes"][0]["nodes"].append(
+                {
+                    "type": "con",
+                    "id": 9999,
+                    "rect": {"x": 0, "y": 0, "width": reads, "height": 100},
+                    "nodes": [],
+                    "floating_nodes": [],
+                }
+            )
+            return tree
+
+        with unittest.mock.patch.object(self.restore_mod, "get_tree", changing_tree):
+            self.restore_mod._verify_floating_geometry(
+                [make_workspace("2", nodes=[], floating=[node])], ctx
+            )
+        self.assertLess(reads, 10)
+        self.assertFalse(any("did not settle" in f for f in ctx.failures), ctx.failures)
+
+    def test_the_final_staging_focus_does_not_mask_a_geometry_error(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        staging_calls = 0
+
+        def record(command):
+            nonlocal staging_calls
+            self.calls.append(command)
+            if command == "workspace _session_restore":
+                staging_calls += 1
+                if staging_calls > 1:
+                    raise OSError("staging is gone")
+            return True
+
+        with (
+            unittest.mock.patch.object(self.restore_mod, "cmd", record),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_apply_sway_geometry",
+                side_effect=RuntimeError("original failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "original failure"),
+        ):
+            self._verify(
+                [
+                    self._live_tree(self.LIVE_RECT),
+                    self._live_tree(self.LIVE_RECT),
+                ],
+                node,
+                ctx,
+            )
+
+    def test_the_decoration_is_included_in_the_reapplied_geometry(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod, "_live_deco_height", return_value=20
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod, "_workspace_origin", return_value=(0, 0)
+            ),
+        ):
+            self._verify(
+                [
+                    self._live_tree(self.LIVE_RECT),
+                    self._live_tree(self.LIVE_RECT),
+                    self._live_tree(self.SAVED_RECT),
+                    self._live_tree(self.SAVED_RECT),
+                ],
+                node,
+                ctx,
+            )
+        self.assertTrue(
+            any("resize set width 600 px height 399 px" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertTrue(
+            any("move position 100 101" in c for c in self.calls), self.calls
+        )
+
+    def test_a_fullscreen_window_is_skipped(self):
+        """A fullscreen window fills its output, so its rect never matches."""
+        ctx = self._context()
+        node = self._saved_window(fullscreen_mode=1)
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify(
+            [self._live_tree({"x": 0, "y": 0, "width": 1920, "height": 1080})],
+            node,
+            ctx,
+        )
+        self.assertFalse(
+            any("resize set" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertEqual(ctx.failures, [])
+
+    def test_i3_is_not_compared(self):
+        """i3 reports the frame rect, which is not the size that was asked for."""
+        self.backend = "i3"
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        source = self._verify([self._live_tree(self.LIVE_RECT)], node, ctx)
+        self.assertEqual(source.calls, 0)
+        self.assertFalse(
+            any("resize set" in c for c in self.calls),
+            self.calls,
+        )
+
+    def test_a_geometry_that_does_not_stick_is_reported(self):
+        """A window that still does not match is reported, not passed over."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify([self._live_tree(self.LIVE_RECT)], node, ctx)
+        self.assertTrue(
+            any("geometry is" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_a_reapplied_geometry_that_sticks_is_not_reported(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify(
+            [
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.SAVED_RECT),
+                self._live_tree(self.SAVED_RECT),
+            ],
+            node,
+            ctx,
+        )
+        self.assertEqual(ctx.failures, [])
+
+    def test_an_intermediate_rect_is_not_reported_as_the_final_state(self):
+        """Sway can expose an intermediate rect before the correction sticks."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        intermediate = {"x": 100, "y": 121, "width": 640, "height": 502}
+        self._verify(
+            [
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(intermediate),
+                self._live_tree(self.SAVED_RECT),
+                self._live_tree(self.SAVED_RECT),
+            ],
+            node,
+            ctx,
+        )
+        self.assertEqual(ctx.failures, [])
+
+    def test_an_unreadable_tree_is_reported_as_unverified(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        with unittest.mock.patch.object(
+            self.restore_mod, "get_tree", side_effect=OSError("cannot connect")
+        ):
+            self.restore_mod._verify_floating_geometry(
+                [make_workspace("2", nodes=[], floating=[node])], ctx
+            )
+        self.assertTrue(
+            any("could not be verified" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_a_materialized_window_that_vanished_is_reported_missing(self):
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        tree = self._live_tree(self.LIVE_RECT)
+        tree["nodes"][0]["nodes"][0]["floating_nodes"] = []
+        self._verify([tree], node, ctx)
+        self.assertEqual(ctx.missing, ["foot window"])
+
+    def test_a_window_relocated_by_the_correction_is_reported(self):
+        """The right rect on the wrong workspace is still a failed restore."""
+        ctx = self._context()
+        node = self._saved_window()
+        ctx.registry.adopt(node, self.WIN_ID)
+        self._verify(
+            [
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.LIVE_RECT),
+                self._live_tree(self.SAVED_RECT, workspace="1"),
+            ],
+            node,
+            ctx,
+        )
+        self.assertTrue(
+            any("workspace is '1'" in failure for failure in ctx.failures),
+            ctx.failures,
+        )
+
+    def test_a_window_that_never_came_back_is_skipped(self):
+        """A node that was never materialized has no live id to compare."""
+        ctx = self._context()
+        node = self._saved_window()
+        self._verify([self._live_tree(self.LIVE_RECT)], node, ctx)
+        self.assertFalse(
+            any("resize set" in c for c in self.calls),
+            self.calls,
+        )
+        self.assertEqual(ctx.failures, [])
+
+
+class TestReadTree(unittest.TestCase):
+    """The live tree is read once and shared, so a failure has to be clear."""
+
+    def test_an_unreadable_tree_clears_the_placements(self):
+        ctx = RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        with unittest.mock.patch.object(
+            restore_mod, "get_tree", side_effect=OSError("cannot connect")
+        ):
+            self.assertIsNone(restore_mod._read_tree(ctx))
+        # The cached placements are dropped, so the next placement check asks
+        # the compositor itself instead of trusting a stale answer.
+        self.assertIsNone(ctx.placements)
 
 
 if __name__ == "__main__":
