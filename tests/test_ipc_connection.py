@@ -44,9 +44,6 @@ class FakeCompositor:
         assert self.conn is not None
         self.conn.sendall(payload)
 
-    def send_reply(self, text: str):
-        self.send_message(0, text)
-
     def send_message(self, msg_type: int, text: str):
         body = text.encode()
         self.send(HEADER.pack(MAGIC, len(body), msg_type) + body)
@@ -170,24 +167,6 @@ class TestRequests(unittest.TestCase):
         with self.assertRaises(IpcError):
             conn.get_tree()
 
-    def test_command_checked_rejects_a_failed_subcommand(self):
-        conn = IpcConnection(sock_path=self.server.path)
-        with (
-            unittest.mock.patch.object(
-                conn,
-                "command",
-                return_value=[{"success": True}, {"success": False}],
-            ),
-            self.assertRaises(IpcError),
-        ):
-            conn.command_checked("split h")
-
-    def test_command_checked_returns_successful_results(self):
-        conn = IpcConnection(sock_path=self.server.path)
-        results = [{"success": True}]
-        with unittest.mock.patch.object(conn, "command", return_value=results):
-            self.assertEqual(conn.command_checked("split h"), results)
-
     def test_a_non_list_reply_is_refused(self):
         """An empty list would look like a command that did nothing."""
         conn = self._connect()
@@ -306,12 +285,18 @@ class TestWriteDeadlines(unittest.TestCase):
             sock.written, HEADER.pack(MAGIC, len(body), MSG_RUN_COMMAND) + body
         )
 
-    def test_a_closed_peer_is_an_ipc_error(self):
+    def test_a_peer_that_accepts_nothing_times_out(self):
+        """A socket that accepts no bytes must not spin past the deadline.
+
+        A blocking socket either sends something or raises, so the zero-byte
+        case is only reachable through a fake; the write deadline bounds it.
+        """
         sock = FakeSocket()
         conn = self._connection(sock)
         with self._writable(sock), self.assertRaises(IpcError) as raised:
             conn._send(MSG_GET_TREE)
-        self.assertIn("closed", str(raised.exception))
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreater(sock.calls, 0)
 
     def test_a_failed_send_is_an_ipc_error(self):
         sock = FakeSocket(error=OSError("broken pipe"))

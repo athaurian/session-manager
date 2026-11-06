@@ -192,7 +192,7 @@ class IpcConnection:
     def __init__(
         self,
         sock_path: str | None = None,
-        request_timeout: float | None = IPC_REQUEST_TIMEOUT,
+        request_timeout: float = IPC_REQUEST_TIMEOUT,
     ) -> None:
         self.sock_path = sock_path or resolve_socket_path()
         if not self.sock_path:
@@ -233,14 +233,6 @@ class IpcConnection:
         except OSError:
             pass
 
-    def __enter__(self) -> Self:
-        if self._sock is None:
-            self.connect()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
     # -- wire ----------------------------------------------------------
 
     def _send(self, msg_type: int, payload: str | bytes = b"") -> None:
@@ -256,10 +248,7 @@ class IpcConnection:
         data = HEADER.pack(MAGIC, len(body), msg_type) + body
         # A read may be told to wait forever, but a write never may: a
         # compositor that stopped reading must not block the manager.
-        write_timeout = self.request_timeout
-        if write_timeout is None:
-            write_timeout = IPC_REQUEST_TIMEOUT
-        deadline = time.monotonic() + write_timeout
+        deadline = time.monotonic() + self.request_timeout
         while data:
             timeout = deadline - time.monotonic()
             if timeout <= 0:
@@ -274,8 +263,6 @@ class IpcConnection:
                 sent = s.send(data)
             except OSError as exc:
                 raise IpcError("socket closed during send") from exc
-            if sent <= 0:
-                raise IpcError("socket closed by Sway")
             data = data[sent:]
 
     def _read_exact(self, n: int, deadline: float | None) -> bytes:
@@ -359,7 +346,7 @@ class IpcConnection:
                 # usable. Drop it and let the next call reconnect.
                 self.close()
                 raise IpcError(f"IPC request timed out: {exc}") from exc
-            except (IpcError, OSError):
+            except OSError:
                 # The reply may be half-read, so the stream is no longer
                 # usable. Drop it and let the next call reconnect.
                 self.close()
@@ -369,14 +356,6 @@ class IpcConnection:
         if not isinstance(payload, list):
             raise IpcError(f"RUN_COMMAND returned {type(payload).__name__}")
         return payload
-
-    def command_checked(self, cmd: str, *, timeout: float | None = None) -> list[dict]:
-        """Run a command and raise when the compositor reports failure."""
-        result = self.command(cmd, timeout=timeout)
-        bad = [r for r in result if not r.get("success", False)]
-        if bad:
-            raise IpcError(f"command failed: {cmd!r} -> {bad}")
-        return result
 
     def get_tree(self, *, timeout: float | None = None) -> dict[str, Any]:
         """Return the current compositor tree."""
@@ -389,7 +368,7 @@ class IpcConnection:
             except TimeoutError as exc:
                 self.close()
                 raise IpcError(f"IPC request timed out: {exc}") from exc
-            except (IpcError, OSError):
+            except OSError:
                 self.close()
                 raise
         if msg_type != MSG_GET_TREE:
@@ -489,8 +468,6 @@ def connection() -> IpcConnection:
         if _shared is None or _shared._sock is None:
             # A closed connection means the previous one was dropped after
             # a failure, so a fresh socket is needed.
-            if _shared is not None:
-                _shared.close()
             _shared = IpcConnection().connect()
         return _shared
 
