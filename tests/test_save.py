@@ -160,6 +160,49 @@ class TestSaveSession(unittest.TestCase):
             leftovers = [f for f in Path(tmp).iterdir() if f.name != "out.json"]
             self.assertEqual(leftovers, [])
 
+    def test_atomic_write_removes_its_temporary_file_after_a_failed_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.json"
+            target.write_text("old", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(
+                    save_mod.os, "replace", side_effect=OSError("disk full")
+                ),
+                self.assertRaises(OSError),
+            ):
+                save_mod._atomic_write(target, "new")
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(Path(tmp).iterdir()), [target])
+
+    def test_fsync_dir_reports_a_failed_sync(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            unittest.mock.patch.object(
+                save_mod.os, "fsync", side_effect=OSError("I/O error")
+            ),
+            self.assertRaises(OSError),
+        ):
+            save_mod._fsync_dir(Path(tmp))
+
+    def test_atomic_copy_leaves_the_destination_intact_after_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            destination = Path(tmp) / "destination"
+            source.write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(
+                    save_mod.shutil, "copy2", side_effect=OSError("busy")
+                ),
+                self.assertRaises(OSError),
+            ):
+                save_mod._copy_atomic(source, destination)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+            self.assertEqual(
+                {path.name for path in Path(tmp).iterdir()},
+                {"destination", "source"},
+            )
+
     def test_hidden_scratchpad_windows_are_saved(self):
         scratch = make_workspace(
             "__i3_scratch",
@@ -190,10 +233,18 @@ class TestSaveSession(unittest.TestCase):
 
     def test_rotation_failure_does_not_block_the_save(self):
         self.state_file.write_text("current", encoding="utf-8")
-        with unittest.mock.patch.object(Path, "replace", side_effect=OSError("busy")):
-            self._save()
+        self._backup("1").write_text("previous", encoding="utf-8")
+        with unittest.mock.patch.object(
+            save_mod.shutil, "copy2", side_effect=OSError("busy")
+        ):
+            saved = self._save()
+        self.assertTrue(saved)
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         self.assertEqual(payload["version"], CURRENT_VERSION)
+        # The rotation moved the old backup along before it failed, so no
+        # saved session was lost.
+        self.assertEqual(self._backup("2").read_text(encoding="utf-8"), "previous")
+        self.assertFalse(self._backup("1").exists())
 
     def test_failed_write_leaves_the_previous_state_in_place(self):
         self.state_file.write_text("current", encoding="utf-8")

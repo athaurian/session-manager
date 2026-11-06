@@ -102,6 +102,23 @@ def _atomic_write(path: Path, content: str) -> None:
     _fsync_dir(path.parent)
 
 
+def _copy_atomic(source: Path, destination: Path) -> None:
+    """Copy a file through a temporary path, then replace the destination."""
+    with tempfile.NamedTemporaryFile(
+        dir=str(destination.parent),
+        prefix=f".{destination.name}.tmp",
+        delete=False,
+    ) as f:
+        tmp_path = Path(f.name)
+    try:
+        shutil.copy2(source, tmp_path)
+        os.replace(tmp_path, destination)
+        _fsync_dir(destination.parent)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _rotate_backups() -> str:
     """Rotate numbered backups without removing the live state file.
 
@@ -115,13 +132,13 @@ def _rotate_backups() -> str:
             src = STATE_FILE.with_name(f"{STATE_FILE.name}.{i - 1}")
             dst = STATE_FILE.with_name(f"{STATE_FILE.name}.{i}")
             if src.exists():
-                if dst.exists():
-                    dst.unlink()
+                # `replace` overwrites the destination atomically, so the old
+                # backup is never missing for longer than the rename itself.
                 src.replace(dst)
         first = STATE_FILE.with_name(f"{STATE_FILE.name}.1")
-        if first.exists():
-            first.unlink()
-        shutil.copy2(STATE_FILE, first)
+        # Copy through a temporary file so the new backup appears atomically
+        # and a failed copy cannot leave a truncated destination.
+        _copy_atomic(STATE_FILE, first)
         log.info("Rotated backups: %s -> %s.1/.2/.3", STATE_FILE, STATE_FILE)
         return " (backup .1 created)"
     except OSError as exc:
