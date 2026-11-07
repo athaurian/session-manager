@@ -59,6 +59,18 @@ class TestNotify(NotifyTestCase):
         self.patch_run(side_effect=OSError("dbus gone"))
         logging_setup.notify("hello")
 
+    def test_a_hung_notify_send_does_not_block(self):
+        """A notification is a courtesy; it must not hold up a restore."""
+        self.patch_run(
+            side_effect=logging_setup.subprocess.TimeoutExpired("notify-send", 5.0)
+        )
+        logging_setup.notify("hello")
+
+    def test_notify_send_has_a_timeout(self):
+        run = self.patch_run(return_value=unittest.mock.Mock(stdout=""))
+        logging_setup.notify("hello")
+        self.assertIsNotNone(run.call_args.kwargs.get("timeout"))
+
 
 if __name__ == "__main__":
     unittest.main()

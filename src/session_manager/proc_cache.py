@@ -1,4 +1,4 @@
-"""Single-pass /proc indexer. Indexing costs O(N) once; lookups are O(1)."""
+"""Single-pass /proc indexer. Indexing costs O(N) once; name lookups are O(1)."""
 
 from __future__ import annotations
 
@@ -121,6 +121,20 @@ class ProcCache:
         """Report whether a process with the given name is running."""
         return bool(self.by_comm(name) or self.by_cmdline_name(name))
 
+    def cmdline_contains(self, text: str) -> bool:
+        """Report whether any process mentions the given text in its command line.
+
+        A launcher script may exec a generic binary, so the process name
+        alone no longer identifies the app. Vesktop's wrapper execs
+        ``electron44`` and keeps the app's path only in the arguments.
+        """
+        needle = text.lower()
+        return any(
+            needle in arg.lower()
+            for entry in self._entries.values()
+            for arg in entry.cmdline
+        )
+
     def get_nvim_pid(self, pid: int) -> int | None:
         """Return a Neovim descendant of a pid, searching depth-first."""
         for child in sorted(self.children(pid)):
@@ -137,19 +151,25 @@ class ProcCache:
         for child in sorted(self.children(pid)):
             entry = self.get(child)
             if entry and entry.comm == "zellij":
-                # Look for --session or -s <name> or attach -c <name>
+                # Look for --session or -s <name>, or attach <name> and
+                # attach -c <name>.
                 for i, arg in enumerate(entry.cmdline):
                     if arg in ("--session", "-s", "--session-name") and i + 1 < len(
                         entry.cmdline
                     ):
                         return entry.cmdline[i + 1]
-                    if arg in ("attach", "a") and "-c" in entry.cmdline:
-                        try:
-                            idx = entry.cmdline.index("-c")
-                            if idx + 1 < len(entry.cmdline):
-                                return entry.cmdline[idx + 1]
-                        except ValueError:
-                            pass
+                    if arg in ("attach", "a"):
+                        # `zellij attach <name>` joins that session, and
+                        # `zellij attach -c <name>` creates one under
+                        # that name.
+                        if i + 1 >= len(entry.cmdline):
+                            continue
+                        following = entry.cmdline[i + 1]
+                        if following == "-c":
+                            if i + 2 < len(entry.cmdline):
+                                return entry.cmdline[i + 2]
+                        elif not following.startswith("-"):
+                            return following
                 return entry.cmdline[0] if entry.cmdline else "zellij"
             deeper = self.get_zellij_session(child)
             if deeper:

@@ -24,12 +24,19 @@ def _app_id(node: dict) -> str:
     ).lower()
 
 
+def _rect_for(workspace: str, rect: dict) -> dict:
+    """Hidden scratchpad geometry is not user-visible, so do not compare it."""
+    return {} if workspace == "__i3_scratch" else rect
+
+
 def _saved_windows(payload: dict) -> list[tuple[str, str, dict]]:
     windows: list[tuple[str, str, dict]] = []
 
     def walk(node: dict, workspace: str) -> None:
         if node.get("type") == "window":
-            windows.append((workspace, _app_id(node), node.get("rect", {})))
+            windows.append(
+                (workspace, _app_id(node), _rect_for(workspace, node.get("rect", {})))
+            )
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
             walk(child, workspace)
 
@@ -39,6 +46,8 @@ def _saved_windows(payload: dict) -> list[tuple[str, str, dict]]:
         name = str(workspace.get("name", ""))
         for child in workspace.get("nodes", []) + workspace.get("floating_nodes", []):
             walk(child, name)
+    for node in payload.get("hidden_scratchpad", []):
+        walk(node, "__i3_scratch")
     return windows
 
 
@@ -51,7 +60,13 @@ def _live_windows(tree: dict) -> list[tuple[str, str, dict]]:
         if node.get("type") in ("con", "floating_con"):
             app_id = _app_id(node)
             if app_id and app_id not in IGNORED_APPS:
-                windows.append((workspace, app_id, node.get("rect", {})))
+                windows.append(
+                    (
+                        workspace,
+                        app_id,
+                        _rect_for(workspace, node.get("rect", {})),
+                    )
+                )
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
             walk(child, workspace)
 

@@ -3,44 +3,12 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-from .apps.calibre import calibre_title_from_window, get_ebook_viewer_document
-from .apps.mpv import get_mpv_info
-from .apps.thunar import get_thunar_info
-from .apps.zathura import get_zathura_info
-from .config import (
-    DROP_TERMINAL_INSTANCE,
-    DROP_TERMINAL_TITLE,
-    NVIM_SESSION_DIR,
-    TRANSIENT_TERMINAL_TITLES,
-    escape_cwd,
-)
+from .apps.handlers import handler_for
 from .ipc import node_app_id, node_class, node_instance, node_pid
-from .nvim.inspect import get_terminal_nvim_state, is_dashboard_state
-from .nvim.snapshot import (
-    create_manager_snapshot,
-    get_nvim_snapshot_path,
-    snacks_sidecar_path,
-)
-from .nvim.sockets import nvim_socket_path
 from .proc_cache import ProcCache
 
 log = logging.getLogger("session_manager")
-
-# The drop terminal is identified by any of its WM_CLASS instance, window name,
-# or mark, because each window manager surfaces a different subset of them.
-_TRANSIENT_KITTY_TITLES = frozenset(TRANSIENT_TERMINAL_TITLES)
-_TRANSIENT_KITTY_INSTANCES = frozenset(TRANSIENT_TERMINAL_TITLES)
-_DROP_KITTY_MARK = "drop_term"
-_DROP_KITTY_TITLE = DROP_TERMINAL_TITLE
-_DROP_KITTY_INSTANCE = DROP_TERMINAL_INSTANCE
-
-
-def _legacy_session_file(cwd: str) -> str:
-    """Return a legacy per-directory session file path, or an empty string."""
-    sf = NVIM_SESSION_DIR / f"{escape_cwd(cwd)}.vim"
-    return str(sf) if sf.exists() else ""
 
 
 def _has_window_identity(node: dict) -> bool:
@@ -107,31 +75,6 @@ def _window_source(node: dict) -> dict | None:
     return _merge_floating_wrapper(node)
 
 
-def _kitty_app_id(node: dict, app_id: str) -> str | None:
-    """Classify kitty windows and drop transient scratchpad terminals."""
-    if app_id != "kitty":
-        return app_id
-
-    title = node.get("name") or ""
-    instance = node_instance(node)
-    marks = node.get("marks") or []
-
-    if (
-        title in _TRANSIENT_KITTY_TITLES
-        or instance in _TRANSIENT_KITTY_INSTANCES
-        or any(mark in _TRANSIENT_KITTY_INSTANCES for mark in marks)
-    ):
-        return None
-
-    if (
-        title == _DROP_KITTY_TITLE
-        or instance == _DROP_KITTY_INSTANCE
-        or _DROP_KITTY_MARK in marks
-    ):
-        return "kitty_drop"
-    return app_id
-
-
 def clean_floating(node: dict, cache: ProcCache) -> list[dict]:
     """Clean one floating child into the windows it holds.
 
@@ -179,88 +122,24 @@ def clean_tree(node: dict, cache: ProcCache) -> dict | None:
 
     if source is not None and ntype in ("con", "floating_con"):
         cls = node_class(source)
-        app_id = _kitty_app_id(source, node_app_id(source))
-        if app_id is None:
-            return None
+        app_id = node_app_id(source)
+        handler = handler_for(app_id)
+        if handler.classify is not None:
+            classified = handler.classify(source, app_id)
+            if classified is None:
+                return None
+            app_id = classified
+            # The refined identity may have its own handler, as when a kitty
+            # window turns out to be the dropdown terminal.
+            handler = handler_for(app_id)
 
         pid = node_pid(source)
-        info: dict[str, object] = {}
-
-        if app_id in ("kitty", "kitty_drop"):
-            cwd = cache.get_terminal_cwd(pid) if pid else str(Path.home())
-            zellij_sess = cache.get_zellij_session(pid) if pid else None
-            is_ssh, ssh_cmd = cache.is_ssh_or_sudo(pid) if pid else (False, "")
-            nvim_pid = cache.get_nvim_pid(pid) if pid else None
-
-            if zellij_sess is not None:
-                info["nvim_type"] = "none"
-                info["zellij_session"] = zellij_sess
-                info["cwd"] = cwd
-                log.info("Kitty %s has zellij session %s", pid, zellij_sess)
-            elif is_ssh:
-                info["nvim_type"] = "none"
-                info["was_ssh"] = ssh_cmd
-                info["cwd"] = cwd
-                log.info("Kitty %s is ssh/sudo (%s), saving cwd only", pid, ssh_cmd)
-            elif nvim_pid is not None:
-                nvim_server_pid, live_state = get_terminal_nvim_state(pid, cache)
-
-                if live_state is None:
-                    info["nvim_type"] = "unknown"
-                    info["session_file"] = _legacy_session_file(cwd)
-                elif is_dashboard_state(live_state):
-                    info["nvim_type"] = "dashboard"
-                else:
-                    snapshot_path = get_nvim_snapshot_path(cwd, nvim_server_pid)
-                    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                    server_path = (
-                        str(nvim_socket_path(nvim_server_pid))
-                        if nvim_server_pid is not None
-                        else ""
-                    )
-                    ok, err = create_manager_snapshot(
-                        server_path, snapshot_path, nvim_server_pid
-                    )
-                    if ok and snapshot_path.exists():
-                        info["nvim_type"] = "session"
-                        info["nvim_snapshot"] = str(snapshot_path)
-                        sidecar = snacks_sidecar_path(snapshot_path)
-                        if sidecar.exists():
-                            info["nvim_snacks_sidecar"] = str(sidecar)
-                    else:
-                        info["nvim_type"] = "unknown"
-                        info["session_file"] = _legacy_session_file(cwd)
-                        log.warning(
-                            "Failed to snapshot nvim in %s (using file): %s", cwd, err
-                        )
-                info["cwd"] = cwd
-            else:
-                info["nvim_type"] = "none"
-                info["cwd"] = cwd
-
-        elif app_id == "org.pwmt.zathura":
-            doc, page = get_zathura_info(pid)
-            info = {"document_path": doc, "page_number": page}
-
-        elif app_id == "calibre-ebook-viewer":
-            parsed = calibre_title_from_window(source.get("name", ""))
-            if parsed is not None:
-                title_part, fmt = parsed
-                doc_path = get_ebook_viewer_document(title_part, fmt)
-                info = {
-                    "document_path": doc_path or "",
-                    "calibre_format": fmt,
-                }
-            else:
-                info = {"document_path": "", "calibre_format": ""}
-
-        elif app_id == "thunar":
-            folder = get_thunar_info(pid)
-            info = {"folder_path": folder}
-
-        elif app_id == "mpv":
-            media = get_mpv_info(pid)
-            info = {"media_path": media}
+        try:
+            info = handler.capture(source, pid, cache) if handler.capture else {}
+        except Exception:
+            # One app's capture failure must not discard the whole session.
+            log.exception("Failed to capture %s; saving the window without it", app_id)
+            info = {}
 
         percent = source.get("percent")
         window: dict[str, object] = {

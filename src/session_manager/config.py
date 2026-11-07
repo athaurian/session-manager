@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from pathlib import Path
@@ -71,15 +72,15 @@ LOCK_FILE_NAME = f"{BACKEND}_session.lock"
 # Both window managers keep the i3 scratchpad workspace name.
 SCRATCHPAD_WORKSPACE = "__i3_scratch"
 SCRATCH_RESTORE_WORKSPACE = "__scratch_restore"
+# Visible windows are materialized here before they are placed. i3 refuses
+# names that start with "__", so this one must stay a normal workspace name.
+RESTORE_STAGING_WORKSPACE = "_session_restore"
+# Restore-only workspaces are an implementation detail. They are never saved
+# as user workspaces and are dropped from an older state file.
+STAGING_WORKSPACES = frozenset({RESTORE_STAGING_WORKSPACE, SCRATCH_RESTORE_WORKSPACE})
 
 DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600
-
-# A floating window that has just started asks Sway for its own size, and
-# that request can land after the restore's resize and undo it. Apply the
-# geometry again after this delay, once the window has settled, so the
-# restored size sticks.
-FLOAT_GEOMETRY_RETRY_DELAY = 0.4
 
 
 def escape_cwd(cwd: str) -> str:
@@ -93,11 +94,19 @@ def escape_cwd(cwd: str) -> str:
 
 
 def _float_env(name: str, default: float) -> float:
-    """Read a float environment variable, falling back on invalid input."""
+    """Read a float environment variable, falling back on invalid input.
+
+    Only a finite, non-negative number is accepted. A timeout of ``nan``
+    or ``inf`` would break every deadline that uses it, and a negative
+    one would make the deadline fire immediately.
+    """
     try:
-        return float(os.environ.get(name, str(default)))
+        value = float(os.environ.get(name, str(default)))
     except ValueError:
         return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
 
 
 IPC_REQUEST_TIMEOUT = _float_env("SWAY_SESSION_IPC_REQUEST_TIMEOUT", 1.0)
@@ -138,12 +147,6 @@ APP_PROFILES: dict[str, AppProfile] = {
         "timeout": 15.0,
         "singleton": False,
     },
-    "mpv": {
-        "settle": 0.3,
-        "reject_floating": False,
-        "timeout": 15.0,
-        "singleton": False,
-    },
     "org.pwmt.zathura": {
         # A large PDF can take tens of seconds to map its window on a cold
         # cache. The wait ends as soon as the window appears or the process
@@ -174,6 +177,10 @@ DEFAULT_APP_PROFILE: AppProfile = {
     "singleton": False,
 }
 
+# How many saved windows restore launches at once. This bounds process
+# fan-out; app-identity launches are serialized per app regardless.
+MATERIALIZE_WORKERS = 4
+
 # Shared timeouts for the waits other modules perform.
 TERMINAL_WAIT_TIMEOUT = 15.0
 APP_WAIT_TIMEOUT = 15.0
@@ -191,17 +198,12 @@ HELIUM_ASSIGNMENT_TIMEOUT = 5.0
 HELIUM_WINDOW_STALL_TIMEOUT = 3.0
 
 APP_ID_COMMANDS: dict[str, str] = {
-    "helium": "helium-browser",
     "vesktop": "vesktop",
-    "thunar": "thunar",
-    "mpv": "mpv",
     "blueman-manager": "blueman-manager",
     "pavucontrol": "pavucontrol",
     # Qt5 wrapper desktop entry, which pins qt5ct.
     "org.keepassxc.KeePassXC": "gtk-launch org.keepassxc.KeePassXC",
-    "org.pwmt.zathura": "zathura",
     "calibre-gui": "calibre",
-    "calibre-ebook-viewer": "ebook-viewer",
 }
 
 # X11 exposes only WM_CLASS (class/instance), while Wayland apps have an
@@ -238,6 +240,11 @@ def canonical_app_id(value: str) -> str:
 # window manager's `for_window` rule keys on. Both the launcher and the save-side
 # classifier share it so a restored drop terminal stays recognisable.
 DROP_TERMINAL_INSTANCE = "scratchpad_term"
+
+# The mark the drop terminal window carries. It shares its value with the
+# title, but it is a separate fact: the compositor's `for_window` rule and
+# the save-side classifier read them from different places.
+DROP_TERMINAL_MARK = "drop_term"
 
 # Titles the transient helper terminals use. They come and go on their own, so
 # saving them would resurrect scratch helpers on the next restore.

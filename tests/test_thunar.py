@@ -44,14 +44,17 @@ class TestGetThunarInfo(unittest.TestCase):
 
 
 class TestLaunchThunar(unittest.TestCase):
-    def _launch(self, node, win_id=55):
+    def _launch(self, node, win_id=55, baseline=()):
         popen = RecordingPopen()
         claimed = set()
         with (
             unittest.mock.patch.object(thunar_mod.subprocess, "Popen", popen),
             unittest.mock.patch.object(thunar_mod, "WindowEventWatcher", FakeWatcher),
             unittest.mock.patch.object(
-                gen_mod, "wait_for_window_by_pid", return_value=win_id
+                thunar_mod, "matching_window_ids", return_value=list(baseline)
+            ),
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=win_id
             ),
         ):
             result = thunar_mod.launch_thunar(node, claimed)
@@ -78,6 +81,40 @@ class TestLaunchThunar(unittest.TestCase):
         result, claimed, _ = self._launch({}, win_id=None)
         self.assertIsNone(result)
         self.assertEqual(claimed, set())
+
+    def test_matches_by_app_identity_not_by_pid(self):
+        """Thunar is single-instance: the window belongs to the daemon."""
+        with (
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=55
+            ) as wait,
+            unittest.mock.patch.object(
+                thunar_mod.subprocess, "Popen", RecordingPopen()
+            ),
+            unittest.mock.patch.object(thunar_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                thunar_mod, "matching_window_ids", return_value=[]
+            ),
+        ):
+            thunar_mod.launch_thunar({"folder_path": "/tmp"}, set())
+        self.assertEqual(wait.call_args.args[0], "thunar")
+        self.assertFalse(wait.call_args.kwargs["fail_fast_on_exit"])
+
+    def test_existing_windows_are_the_baseline(self):
+        with (
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=55
+            ) as wait,
+            unittest.mock.patch.object(
+                thunar_mod.subprocess, "Popen", RecordingPopen()
+            ),
+            unittest.mock.patch.object(thunar_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                thunar_mod, "matching_window_ids", return_value=[11, 12]
+            ),
+        ):
+            thunar_mod.launch_thunar({"folder_path": "/tmp"}, set())
+        self.assertEqual(wait.call_args.kwargs["baseline_ids"], {11, 12})
 
 
 if __name__ == "__main__":

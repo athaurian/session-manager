@@ -19,6 +19,7 @@ from session_manager.ipc import (
     HEADER,
     MAGIC,
     MSG_GET_TREE,
+    MSG_RUN_COMMAND,
     MSG_SUBSCRIBE,
     IpcConnection,
     IpcError,
@@ -42,9 +43,6 @@ class FakeCompositor:
     def send(self, payload: bytes):
         assert self.conn is not None
         self.conn.sendall(payload)
-
-    def send_reply(self, text: str):
-        self.send_message(0, text)
 
     def send_message(self, msg_type: int, text: str):
         body = text.encode()
@@ -74,7 +72,7 @@ class TestConnectionFailures(unittest.TestCase):
     def test_command_timeout_closes_the_connection(self):
         conn = self._connect()
         self.server.accept()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(IpcError):
             conn.command("get_tree", timeout=0.2)
         # The socket is dropped so the next command starts fresh.
         self.assertIsNone(conn._sock)
@@ -112,28 +110,36 @@ class TestConnectionFailures(unittest.TestCase):
             IpcConnection(sock_path=os.path.join(self.tmp.name, "gone")).connect()
 
     def test_shared_connection_is_rebuilt_after_a_failure(self):
-        conn = self._connect()
-        conn.close()
+        with unittest.mock.patch.object(
+            ipc_mod, "resolve_socket_path", return_value=self.server.path
+        ):
+            first = ipc_mod.connection()
+            self.server.accept()
+            with self.assertRaises(IpcError):
+                first.command("first", timeout=0.05)
+            self.assertIsNone(first._sock)
 
-        class FakeConnection:
-            def connect(self):
-                return self
-
-            def close(self):
-                pass
-
-        with unittest.mock.patch.object(ipc_mod, "IpcConnection", FakeConnection):
-            rebuilt = ipc_mod.connection()
-        self.assertIsInstance(rebuilt, FakeConnection)
+            # The next caller must get a fresh connection that reads the
+            # reply belonging to its own command.
+            second = ipc_mod.connection()
+            self.assertIsNot(second, first)
+            self.server.accept()
+            self.server.send_message(MSG_RUN_COMMAND, json.dumps([{"success": True}]))
+            self.assertEqual(second.command("second"), [{"success": True}])
         ipc_mod.close_connection()
 
     def test_command_after_a_timeout_reads_the_new_reply(self):
         """The connection is rebuilt, so no stale reply can be returned."""
         conn = self._connect()
         self.server.accept()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(IpcError):
             conn.command("first", timeout=0.2)
         self.assertIsNone(conn._sock)
+
+        conn.connect()
+        self.server.accept()
+        self.server.send_message(MSG_RUN_COMMAND, json.dumps([{"success": True}]))
+        self.assertEqual(conn.command("second"), [{"success": True}])
 
 
 class TestRequests(unittest.TestCase):
@@ -161,23 +167,143 @@ class TestRequests(unittest.TestCase):
         with self.assertRaises(IpcError):
             conn.get_tree()
 
-    def test_command_checked_rejects_a_failed_subcommand(self):
-        conn = IpcConnection(sock_path=self.server.path)
+    def test_a_non_list_reply_is_refused(self):
+        """An empty list would look like a command that did nothing."""
+        conn = self._connect()
+        self.server.send_message(0, json.dumps({"success": True}))
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_malformed_reply_is_an_ipc_error(self):
+        conn = self._connect()
+        self.server.send_message(0, "{not json")
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_reply_that_is_not_utf8_is_an_ipc_error(self):
+        conn = self._connect()
+        body = b"\xff\xfe"
+        self.server.send(HEADER.pack(MAGIC, len(body), 0) + body)
+        with self.assertRaises(IpcError):
+            conn.command("split h")
+
+    def test_a_malformed_tree_reply_is_an_ipc_error(self):
+        conn = self._connect()
+        self.server.send_message(MSG_GET_TREE, "[1, 2]")
+        with self.assertRaises(IpcError):
+            conn.get_tree()
+
+
+class FakeSocket:
+    """A socket stand-in whose writes can stall, fail, or stop early."""
+
+    def __init__(self, sent_per_call=None, error=None):
+        self.sent_per_call = sent_per_call
+        self.error = error
+        self.written = b""
+        self.calls = 0
+
+    def send(self, data):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.sent_per_call is None:
+            # The peer is gone, so nothing is accepted.
+            return 0
+        count = min(self.sent_per_call, len(data))
+        self.written += data[:count]
+        return count
+
+    def shutdown(self, _how):
+        return None
+
+    def close(self):
+        return None
+
+
+class TestWriteDeadlines(unittest.TestCase):
+    """A write must not block forever when the compositor stopped reading.
+
+    A read may be told to wait forever, but a write never may: a compositor
+    that stopped reading must not block the manager.
+    """
+
+    def _connection(self, sock, request_timeout=0.05):
+        conn = IpcConnection(
+            sock_path="/tmp/unused.sock", request_timeout=request_timeout
+        )
+        conn._sock = sock
+        self.addCleanup(conn.close)
+        return conn
+
+    def _writable(self, sock):
+        """Pretend the socket can be written to."""
+        return unittest.mock.patch.object(
+            ipc_mod.select, "select", lambda *_args: ([], [sock], [])
+        )
+
+    def test_a_write_that_cannot_proceed_times_out(self):
+        sock = FakeSocket()
+        conn = self._connection(sock)
         with (
             unittest.mock.patch.object(
-                conn,
-                "command",
-                return_value=[{"success": True}, {"success": False}],
+                ipc_mod.select, "select", return_value=([], [], [])
             ),
-            self.assertRaises(IpcError),
+            self.assertRaises(IpcError) as raised,
         ):
-            conn.command_checked("split h")
+            conn._send(MSG_GET_TREE)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertEqual(sock.calls, 0)
 
-    def test_command_checked_returns_successful_results(self):
-        conn = IpcConnection(sock_path=self.server.path)
-        results = [{"success": True}]
-        with unittest.mock.patch.object(conn, "command", return_value=results):
-            self.assertEqual(conn.command_checked("split h"), results)
+    def test_the_write_deadline_expires_even_on_a_writable_socket(self):
+        """A peer that accepts a byte at a time must still hit the deadline."""
+        sock = FakeSocket(sent_per_call=1)
+        conn = self._connection(sock, request_timeout=0.05)
+        clock = [0.0]
+
+        def fake_monotonic():
+            clock[0] += 0.03
+            return clock[0]
+
+        with (
+            self._writable(sock),
+            unittest.mock.patch.object(ipc_mod.time, "monotonic", fake_monotonic),
+            self.assertRaises(IpcError) as raised,
+        ):
+            conn._send(MSG_RUN_COMMAND, "x" * 100)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreater(sock.calls, 0)
+
+    def test_a_partial_write_is_resumed(self):
+        """A short write must not truncate the message."""
+        sock = FakeSocket(sent_per_call=3)
+        conn = self._connection(sock)
+        with self._writable(sock):
+            conn._send(MSG_RUN_COMMAND, "hello")
+        body = b"hello"
+        self.assertEqual(
+            sock.written, HEADER.pack(MAGIC, len(body), MSG_RUN_COMMAND) + body
+        )
+
+    def test_a_peer_that_accepts_nothing_times_out(self):
+        """A socket that accepts no bytes must not spin past the deadline.
+
+        A blocking socket either sends something or raises, so the zero-byte
+        case is only reachable through a fake; the write deadline bounds it.
+        """
+        sock = FakeSocket()
+        conn = self._connection(sock)
+        with self._writable(sock), self.assertRaises(IpcError) as raised:
+            conn._send(MSG_GET_TREE)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreater(sock.calls, 0)
+
+    def test_a_failed_send_is_an_ipc_error(self):
+        sock = FakeSocket(error=OSError("broken pipe"))
+        conn = self._connection(sock)
+        with self._writable(sock), self.assertRaises(IpcError) as raised:
+            conn._send(MSG_GET_TREE)
+        self.assertIn("closed", str(raised.exception))
 
 
 class TestWindowEventWatcher(unittest.TestCase):

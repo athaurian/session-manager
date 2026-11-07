@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 
+from ..config import NVIM_RPC_TIMEOUT
+
 
 def vim_single_quote(value: str) -> str:
     """Quote a string as a Vim single-quoted literal."""
@@ -25,9 +27,6 @@ def extract_json(text: str, marker: str) -> dict | None:
         if isinstance(value, dict) and marker in value:
             return value
     return None
-
-
-from ..config import NVIM_RPC_TIMEOUT
 
 
 def nvim_rpc(
@@ -54,6 +53,6 @@ def nvim_rpc(
             timeout=timeout,
             env=env,
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     return extract_json(result.stdout + "\n" + result.stderr, marker)

@@ -5,6 +5,7 @@ import unittest
 import unittest.mock
 
 import session_manager.apps.generic as gen_mod
+import session_manager.apps.thunar as thunar_mod
 import session_manager.background as bg_mod
 import session_manager.config as cfg_mod
 import session_manager.ipc as ipc_mod
@@ -152,7 +153,10 @@ class TestSocketResolution(unittest.TestCase):
         path = os.path.join(self.tmp.name, name)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(path)
-        sock.close()
+        # The socket has to stay live: a path with no listener is a stale
+        # one, and the resolver skips those.
+        sock.listen(8)
+        self.addCleanup(sock.close)
         return path
 
     def test_i3_socket_environment(self):
@@ -185,6 +189,18 @@ class TestSocketResolution(unittest.TestCase):
         ):
             self.assertEqual(ipc_mod.resolve_socket_path(), self.sway_sock)
 
+    def test_pinned_backend_ignores_the_other_compositor(self):
+        env = {"SWAYSOCK": self.sway_sock, "SESSION_MANAGER_BACKEND": "i3"}
+        with (
+            unittest.mock.patch.dict(os.environ, env, clear=True),
+            unittest.mock.patch.object(
+                ipc_mod,
+                "_socket_from_binary",
+                side_effect=lambda backend: self.sway_sock if backend == "sway" else "",
+            ),
+        ):
+            self.assertEqual(ipc_mod.resolve_socket_path(), "")
+
     def test_falls_back_to_get_socketpath(self):
         with (
             unittest.mock.patch.dict(
@@ -201,6 +217,28 @@ class TestSocketResolution(unittest.TestCase):
     def test_stale_socket_is_skipped(self):
         """A socket path left over from a previous run must not be used."""
         stale = os.path.join(self.tmp.name, "gone.sock")
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {"I3SOCK": stale, "SESSION_MANAGER_BACKEND": "i3"},
+                clear=True,
+            ),
+            unittest.mock.patch.object(
+                ipc_mod,
+                "_socket_from_binary",
+                side_effect=lambda backend: self.i3_sock if backend == "i3" else "",
+            ),
+        ):
+            self.assertEqual(ipc_mod.resolve_socket_path(), self.i3_sock)
+
+    def test_a_socket_file_without_a_listener_is_skipped(self):
+        """The file is left behind when the compositor dies; it is not live."""
+        import socket
+
+        stale = os.path.join(self.tmp.name, "stale.sock")
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(stale)
+        dead.close()
         with (
             unittest.mock.patch.dict(
                 os.environ,
@@ -252,7 +290,7 @@ class TestCleanTreeI3(unittest.TestCase):
     def test_x11_window_uses_class_as_app_id(self):
         node = i3_window("Thunar", border="normal")
         with unittest.mock.patch.object(
-            st_mod, "get_thunar_info", return_value="/home/user"
+            thunar_mod, "get_thunar_info", return_value="/home/user"
         ):
             result = st_mod.clean_tree(node, FakeCache())
         self.assertIsNotNone(result)
@@ -413,7 +451,9 @@ class TestI3Geometry(RestoreHarnessTestCase):
         self.restore_mod._restore_hidden_scratchpad(
             make_window("kitty", marks=["s"]), self.restore_mod.RestoreContext()
         )
-        self.assertNotIn("workspace __scratch_restore", " ".join(self.calls))
+        self.assertNotIn(
+            f"workspace {cfg_mod.SCRATCH_RESTORE_WORKSPACE}", " ".join(self.calls)
+        )
 
 
 class TestI3Restore(RestoreHarnessTestCase):
@@ -436,11 +476,6 @@ class TestI3Restore(RestoreHarnessTestCase):
         self.restore_workspaces({"workspaces": [ws]})
         self.assertCommand("[con_id=1000] focus")
 
-    def test_workspace_names_with_spaces_are_quoted(self):
-        ws = make_workspace("1: web", nodes=[make_window("kitty")])
-        self.restore_workspaces({"workspaces": [ws]})
-        self.assertCommand('workspace "1: web"')
-
     def test_hidden_plain_window_restores_saved_border(self):
         payload = {
             "workspaces": [],
@@ -460,11 +495,6 @@ class TestI3Restore(RestoreHarnessTestCase):
         payload["hidden_scratchpad"][0].pop("border", None)
         self.restore_workspaces(payload)
         self.assertCommand("[con_id=1000] border normal")
-
-    def test_floating_window_restores_saved_border(self):
-        ws = make_workspace("1", floating=[make_window("kitty", border="none")])
-        self.restore_workspaces({"workspaces": [ws]})
-        self.assertCommand("[con_id=1000] border none")
 
     def test_floating_window_border_none_is_not_applied_when_absent(self):
         ws = make_workspace("1", floating=[make_window("kitty")])

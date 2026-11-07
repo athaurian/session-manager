@@ -1,0 +1,638 @@
+{
+  "version": 3,
+  "wall": [
+    {
+      "id": "seat0",
+      "output": "eDP-1",
+      "workspace": "1",
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 1920,
+        "height": 1080
+      }
+    }
+  ],
+  "workspaces": [
+    {
+      "type": "workspace",
+      "name": "1",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "con",
+          "layout": "splitv",
+          "nodes": [
+            {
+              "type": "window",
+              "app_id": "kitty",
+              "class": "",
+              "name": "heavy-1-a",
+              "pid": 0,
+              "fullscreen_mode": 0,
+              "rect": {
+                "x": 8,
+                "y": 32,
+                "width": 476,
+                "height": 1040
+              },
+              "marks": [
+                "heavy1"
+              ],
+              "border": "pixel",
+              "scratchpad_state": "none",
+              "cwd": "/home/example",
+              "nvim_type": "none",
+              "percent": 0.5
+            },
+            {
+              "type": "window",
+              "app_id": "kitty",
+              "class": "",
+              "name": "heavy-1-b",
+              "pid": 0,
+              "fullscreen_mode": 0,
+              "rect": {
+                "x": 484,
+                "y": 32,
+                "width": 476,
+                "height": 1040
+              },
+              "marks": [],
+              "border": "pixel",
+              "scratchpad_state": "none",
+              "cwd": "/home/example",
+              "nvim_type": "none",
+              "percent": 0.5
+            }
+          ],
+          "floating_nodes": [],
+          "percent": 1.0
+        }
+      ],
+      "floating_nodes": [
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-1-float",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 240,
+            "y": 180,
+            "width": 900,
+            "height": 620
+          },
+          "marks": [],
+          "border": "normal",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none"
+        }
+      ]
+    },
+    {
+      "type": "workspace",
+      "name": "2",
+      "layout": "tabbed",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-2-term",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none"
+        },
+        {
+          "type": "window",
+          "app_id": "helium",
+          "class": "",
+          "name": "Heavy test - Helium",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none"
+        },
+        {
+          "type": "window",
+          "app_id": "helium",
+          "class": "",
+          "name": "Docs - Helium",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none"
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "3",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-3-term",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none",
+          "percent": 0.34
+        },
+        {
+          "type": "window",
+          "app_id": "org.pwmt.zathura",
+          "class": "",
+          "name": "heavy-3-pdf-a",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 484,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "document_path": "/home/example/Books/book-a.pdf",
+          "page_number": 12,
+          "percent": 0.33
+        },
+        {
+          "type": "window",
+          "app_id": "org.pwmt.zathura",
+          "class": "",
+          "name": "heavy-3-pdf-b",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 960,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "document_path": "/home/example/Books/book-b.pdf",
+          "page_number": 34,
+          "percent": 0.33
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "4",
+      "layout": "splitv",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "mpv",
+          "class": "",
+          "name": "heavy_media.webm - mpv",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "media_path": "/tmp/session-manager-fixture/heavy_media.webm",
+          "percent": 0.4
+        },
+        {
+          "type": "window",
+          "app_id": "org.pulseaudio.pavucontrol",
+          "class": "",
+          "name": "Volume Control",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 484,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "percent": 0.3
+        },
+        {
+          "type": "window",
+          "app_id": "blueman-manager",
+          "class": "",
+          "name": "Bluetooth Devices",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 960,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "percent": 0.3
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "5",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-5-term",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none",
+          "percent": 0.5
+        },
+        {
+          "type": "window",
+          "app_id": "thunar",
+          "class": "",
+          "name": "user - Thunar",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 484,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "folder_path": "/home/example",
+          "percent": 0.5
+        }
+      ],
+      "floating_nodes": [
+        {
+          "type": "window",
+          "app_id": "org.pwmt.zathura",
+          "class": "",
+          "name": "heavy-5-pdf",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 700,
+            "y": 160,
+            "width": 820,
+            "height": 840
+          },
+          "marks": [],
+          "border": "normal",
+          "scratchpad_state": "none",
+          "document_path": "/home/example/Books/book-c.pdf",
+          "page_number": 5
+        }
+      ]
+    },
+    {
+      "type": "workspace",
+      "name": "6",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "con",
+          "layout": "splitv",
+          "nodes": [
+            {
+              "type": "window",
+              "app_id": "kitty",
+              "class": "",
+              "name": "heavy-6-a",
+              "pid": 0,
+              "fullscreen_mode": 0,
+              "rect": {
+                "x": 8,
+                "y": 32,
+                "width": 476,
+                "height": 1040
+              },
+              "marks": [],
+              "border": "pixel",
+              "scratchpad_state": "none",
+              "cwd": "/home/example",
+              "nvim_type": "none",
+              "percent": 0.5
+            },
+            {
+              "type": "window",
+              "app_id": "kitty",
+              "class": "",
+              "name": "heavy-6-b",
+              "pid": 0,
+              "fullscreen_mode": 0,
+              "rect": {
+                "x": 484,
+                "y": 32,
+                "width": 476,
+                "height": 1040
+              },
+              "marks": [],
+              "border": "pixel",
+              "scratchpad_state": "none",
+              "cwd": "/home/example",
+              "nvim_type": "none",
+              "percent": 0.5
+            }
+          ],
+          "floating_nodes": [],
+          "percent": 1.0
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "7",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "calibre-gui",
+          "class": "",
+          "name": "Library - calibre",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "percent": 0.5
+        },
+        {
+          "type": "window",
+          "app_id": "calibre-ebook-viewer",
+          "class": "",
+          "name": "book-e.epub — E-book viewer",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 484,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "document_path": "/home/example/Books/book-e.epub",
+          "calibre_format": "EPUB",
+          "percent": 0.5
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "8",
+      "layout": "tabbed",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "vesktop",
+          "class": "",
+          "name": "Vesktop",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none"
+        },
+        {
+          "type": "window",
+          "app_id": "org.keepassxc.KeePassXC",
+          "class": "",
+          "name": "Passwords - KeePassXC",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none"
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "type": "workspace",
+      "name": "9 notes",
+      "layout": "splith",
+      "nodes": [
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-9-term",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 8,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [
+            "heavy-notes"
+          ],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none",
+          "percent": 0.34
+        },
+        {
+          "type": "window",
+          "app_id": "org.pwmt.zathura",
+          "class": "",
+          "name": "heavy-9-pdf",
+          "pid": 0,
+          "fullscreen_mode": 0,
+          "rect": {
+            "x": 484,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "document_path": "/home/example/Books/book-d.pdf",
+          "page_number": 88,
+          "percent": 0.33
+        },
+        {
+          "type": "window",
+          "app_id": "kitty",
+          "class": "",
+          "name": "heavy-9-fullscreen",
+          "pid": 0,
+          "fullscreen_mode": 1,
+          "rect": {
+            "x": 960,
+            "y": 32,
+            "width": 476,
+            "height": 1040
+          },
+          "marks": [
+            "heavy-fs"
+          ],
+          "border": "pixel",
+          "scratchpad_state": "none",
+          "cwd": "/home/example",
+          "nvim_type": "none",
+          "percent": 0.33
+        }
+      ],
+      "floating_nodes": []
+    }
+  ],
+  "hidden_scratchpad": [
+    {
+      "type": "window",
+      "app_id": "kitty",
+      "class": "",
+      "name": "heavy-hidden-1",
+      "pid": 0,
+      "fullscreen_mode": 0,
+      "rect": {
+        "x": 340,
+        "y": 240,
+        "width": 1000,
+        "height": 700
+      },
+      "marks": [
+        "heavy-hidden-1"
+      ],
+      "border": "pixel",
+      "scratchpad_state": "h",
+      "cwd": "/home/example",
+      "nvim_type": "none"
+    },
+    {
+      "type": "window",
+      "app_id": "kitty",
+      "class": "",
+      "name": "heavy-hidden-2",
+      "pid": 0,
+      "fullscreen_mode": 0,
+      "rect": {
+        "x": 380,
+        "y": 280,
+        "width": 1000,
+        "height": 700
+      },
+      "marks": [
+        "heavy-hidden-2"
+      ],
+      "border": "pixel",
+      "scratchpad_state": "h",
+      "cwd": "/home/example",
+      "nvim_type": "none"
+    },
+    {
+      "type": "window",
+      "app_id": "kitty_drop",
+      "class": "",
+      "name": "drop_term",
+      "pid": 0,
+      "fullscreen_mode": 0,
+      "rect": {
+        "x": 8,
+        "y": 32,
+        "width": 476,
+        "height": 1040
+      },
+      "marks": [
+        "drop_term"
+      ],
+      "border": "normal",
+      "scratchpad_state": "h",
+      "cwd": "/home/example",
+      "nvim_type": "none"
+    }
+  ],
+  "background_apps": [],
+  "focused_workspace": "1"
+}

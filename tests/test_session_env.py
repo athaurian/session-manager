@@ -171,21 +171,22 @@ class TestApplyEnv(EnvTestCase):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(PATH="/usr/bin")
-        self.assertTrue(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
         self.assertEqual(os.environ["DISPLAY"], ":0")
 
     def test_apply_repairs_an_empty_variable(self):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(DISPLAY="")
-        self.assertTrue(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
         self.assertEqual(os.environ["DISPLAY"], ":0")
 
-    def test_apply_reports_no_change_when_nothing_is_missing(self):
+    def test_apply_keeps_a_variable_that_is_already_set(self):
         write_proc_tree(self.root, 1234, "i3", environ={"DISPLAY": ":0"})
         self.patch_backend("i3")
         self.patch_env(DISPLAY=":0")
-        self.assertFalse(session_env.apply_compositor_env())
+        session_env.apply_compositor_env()
+        self.assertEqual(os.environ["DISPLAY"], ":0")
 
 
 class TestParsing(EnvTestCase):
@@ -209,3 +210,34 @@ class TestParsing(EnvTestCase):
         self.assertEqual(session_env._read_environ(999999), {})
         self.assertEqual(session_env._socket_paths(999999), [])
         self.assertEqual(session_env._find_pids("i3"), [])
+
+    def test_a_process_name_that_is_not_utf8_is_skipped(self):
+        """A broken name must not stop the scan."""
+        proc_dir = self.root / "1234"
+        proc_dir.mkdir(parents=True)
+        (proc_dir / "comm").write_bytes(b"i3\xff\n")
+        self.assertEqual(session_env._find_pids("i3"), [])
+
+    def test_a_process_owned_by_another_user_is_skipped(self):
+        """Another user's compositor is not this session's compositor."""
+        proc_dir = self.root / "1234"
+        proc_dir.mkdir(parents=True)
+        (proc_dir / "comm").write_text("i3\n", encoding="utf-8")
+        with unittest.mock.patch.object(session_env.os, "getuid", return_value=4242):
+            self.assertEqual(session_env._find_pids("i3"), [])
+        self.assertEqual(session_env._find_pids("i3"), [1234])
+
+    def test_a_runtime_dir_that_disagrees_is_reported(self):
+        """The compositor's runtime dir wins over a stale one."""
+        write_proc_tree(
+            self.root,
+            4321,
+            "sway",
+            sockets=[("222", "/run/user/1000/wayland-1")],
+        )
+        self.patch_backend("sway")
+        self.patch_env(XDG_RUNTIME_DIR="/run/user/9999")
+        with self.assertLogs(session_env.log, level="WARNING") as logs:
+            env = session_env.compositor_env()
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/9999")
+        self.assertTrue(any("XDG_RUNTIME_DIR" in line for line in logs.output))

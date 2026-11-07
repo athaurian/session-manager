@@ -10,6 +10,7 @@ from pathlib import Path
 
 import session_manager.save as save_mod
 from session_manager.ipc import IpcError
+from session_manager.model import CURRENT_VERSION
 from tests.helpers import make_window, make_workspace
 
 
@@ -41,6 +42,11 @@ class TestFocusedWorkspaceName(unittest.TestCase):
         scratch["floating_nodes"] = [win]
         tree = self._tree([make_workspace("1"), scratch])
         self.assertIsNone(save_mod._focused_workspace_name(tree))
+
+    def test_focused_restore_staging_workspace_ignored(self):
+        staging = make_workspace("_session_restore", nodes=[make_window("kitty")])
+        staging["focused"] = True
+        self.assertIsNone(save_mod._focused_workspace_name(self._tree([staging])))
 
     def test_nothing_focused(self):
         tree = self._tree([make_workspace("1")])
@@ -107,7 +113,7 @@ class TestSaveSession(unittest.TestCase):
             ),
         ):
             pc_cls.snapshot.return_value = self._fake_snapshot()
-            save_mod.save_session(notify_user=False)
+            return save_mod.save_session(notify_user=False)
 
     def _backup(self, suffix):
         return self.state_file.with_name(f"{self.state_file.name}.{suffix}")
@@ -129,7 +135,7 @@ class TestSaveSession(unittest.TestCase):
             save_mod.save_session(notify_user=False)
 
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], CURRENT_VERSION)
         self.assertEqual(payload["focused_workspace"], "1")
         self.assertEqual(len(payload["workspaces"]), 1)
         self.assertEqual(payload["workspaces"][0]["name"], "1")
@@ -154,6 +160,49 @@ class TestSaveSession(unittest.TestCase):
             leftovers = [f for f in Path(tmp).iterdir() if f.name != "out.json"]
             self.assertEqual(leftovers, [])
 
+    def test_atomic_write_removes_its_temporary_file_after_a_failed_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.json"
+            target.write_text("old", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(
+                    save_mod.os, "replace", side_effect=OSError("disk full")
+                ),
+                self.assertRaises(OSError),
+            ):
+                save_mod._atomic_write(target, "new")
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(Path(tmp).iterdir()), [target])
+
+    def test_fsync_dir_reports_a_failed_sync(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            unittest.mock.patch.object(
+                save_mod.os, "fsync", side_effect=OSError("I/O error")
+            ),
+            self.assertRaises(OSError),
+        ):
+            save_mod._fsync_dir(Path(tmp))
+
+    def test_atomic_copy_leaves_the_destination_intact_after_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            destination = Path(tmp) / "destination"
+            source.write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(
+                    save_mod.shutil, "copy2", side_effect=OSError("busy")
+                ),
+                self.assertRaises(OSError),
+            ):
+                save_mod._copy_atomic(source, destination)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+            self.assertEqual(
+                {path.name for path in Path(tmp).iterdir()},
+                {"destination", "source"},
+            )
+
     def test_hidden_scratchpad_windows_are_saved(self):
         scratch = make_workspace(
             "__i3_scratch",
@@ -164,6 +213,14 @@ class TestSaveSession(unittest.TestCase):
         self._save()
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         self.assertEqual(len(payload["hidden_scratchpad"]), 2)
+
+    def test_restore_staging_workspace_is_not_saved(self):
+        staging = make_workspace("_session_restore", nodes=[make_window("calibre-gui")])
+        self.tree["nodes"][0]["nodes"].append(staging)
+        self._save()
+        payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        names = [workspace["name"] for workspace in payload["workspaces"]]
+        self.assertEqual(names, ["1"])
 
     def test_previous_saves_are_rotated(self):
         self.state_file.write_text("current", encoding="utf-8")
@@ -176,16 +233,27 @@ class TestSaveSession(unittest.TestCase):
 
     def test_rotation_failure_does_not_block_the_save(self):
         self.state_file.write_text("current", encoding="utf-8")
-        with unittest.mock.patch.object(Path, "replace", side_effect=OSError("busy")):
-            self._save()
+        self._backup("1").write_text("previous", encoding="utf-8")
+        with unittest.mock.patch.object(
+            save_mod.shutil, "copy2", side_effect=OSError("busy")
+        ):
+            saved = self._save()
+        self.assertTrue(saved)
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], CURRENT_VERSION)
+        # The rotation moved the old backup along before it failed, so no
+        # saved session was lost.
+        self.assertEqual(self._backup("2").read_text(encoding="utf-8"), "previous")
+        self.assertFalse(self._backup("1").exists())
 
-    def test_helium_windows_wait_for_the_session_files(self):
-        self.tree["nodes"][0]["nodes"][0]["nodes"].append(make_window("helium"))
-        with unittest.mock.patch.object(save_mod.time, "sleep") as sleep:
-            self._save()
-        sleep.assert_called_once_with(0.8)
+    def test_failed_write_leaves_the_previous_state_in_place(self):
+        self.state_file.write_text("current", encoding="utf-8")
+        with unittest.mock.patch.object(
+            save_mod.os, "replace", side_effect=OSError("disk full")
+        ):
+            saved = self._save()
+        self.assertFalse(saved)
+        self.assertEqual(self.state_file.read_text(encoding="utf-8"), "current")
 
 
 class TestUnreachableCompositor(unittest.TestCase):

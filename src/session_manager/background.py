@@ -14,7 +14,22 @@ from .proc_cache import ProcCache
 
 log = logging.getLogger("session_manager")
 
-_ORIGINAL_POPEN = subprocess.Popen
+# The installed Vesktop launcher is a wrapper script that execs
+# `electron44`, so the running process is not named "vesktop" and its
+# executable is shared with other Electron apps. Only its command line
+# still names the app's own directory.
+_VESKTOP_CMDLINE_MARKER = "/vesktop"
+
+
+def _vesktop_running(cache: ProcCache) -> bool:
+    """Report whether Vesktop is running.
+
+    The launcher execs a generic Electron binary, so the process name
+    does not identify the app; the command line still does.
+    """
+    return cache.process_named_running("vesktop") or cache.cmdline_contains(
+        _VESKTOP_CMDLINE_MARKER
+    )
 
 
 def detect_background_apps(
@@ -30,9 +45,31 @@ def detect_background_apps(
         if tree is not None
         else matching_window_ids("vesktop", "")
     )
-    if cache.process_named_running("vesktop") and not vesktop_visible:
+    if _vesktop_running(cache) and not vesktop_visible:
         apps.append({"app_id": "vesktop"})
     return apps
+
+
+def _unit_installed(service: str) -> bool:
+    """Report whether a systemd user unit for a daemon is installed.
+
+    A daemon the system does not ship has not gone missing, so it is
+    skipped instead of warned about. When the answer cannot be read the
+    daemon is assumed to be there, which keeps the old behaviour.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", service, "-p", "LoadState", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        return True
+    return result.stdout.strip() != "not-found"
 
 
 def _ensure_background_daemons(notify_user: bool = True) -> None:
@@ -45,9 +82,6 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
 
     # Skip health checks in tests via explicit opt-out.
     if os.getenv("SWAY_SESSION_SKIP_DAEMON_CHECKS") == "1":
-        return
-    # Skip health checks when subprocess is mocked in tests.
-    if subprocess.Popen is not _ORIGINAL_POPEN:
         return
 
     backend = detect_backend()
@@ -87,6 +121,13 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=1.0, check=False)
             if r.returncode != 0:
+                if service is not None and not _unit_installed(service):
+                    # The system does not ship this daemon, so it has
+                    # not gone missing.
+                    log.debug(
+                        "Skipping %s: no %s user unit is installed", name, service
+                    )
+                    continue
                 msg = f"Background daemon {label} not running, attempting restart"
                 log.warning(msg)
                 if notify_user:
@@ -100,19 +141,9 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
                         timeout=2.0,
                         check=False,
                     )
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    subprocess.TimeoutExpired,
-                    TypeError,
-                ):
+                except (OSError, subprocess.SubprocessError):
                     pass
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            subprocess.TimeoutExpired,
-            TypeError,
-        ):
+        except (OSError, subprocess.SubprocessError):
             continue
 
     # Ensure the session target is active (covers polkit, portal, etc. via
@@ -137,7 +168,7 @@ def _ensure_background_daemons(notify_user: bool = True) -> None:
                 timeout=2.0,
                 check=False,
             )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired, TypeError):
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
@@ -155,7 +186,7 @@ def restore_background_apps(
             return
         try:
             loaded = json.loads(BACKGROUND_APPS_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             log.warning("Could not parse %s", BACKGROUND_APPS_FILE)
             return
         if not isinstance(loaded, list):
@@ -172,7 +203,7 @@ def restore_background_apps(
             continue
         if cache is None:
             cache = ProcCache.snapshot()
-        if cache.process_named_running("vesktop"):
+        if _vesktop_running(cache):
             continue
         try:
             subprocess.Popen(
@@ -185,7 +216,7 @@ def restore_background_apps(
             log.warning("Could not start vesktop: %s", exc)
             continue
         log.info("Restored vesktop --start-minimized")
-        if notify_user and subprocess.Popen is _ORIGINAL_POPEN:
+        if notify_user:
             from .logging_setup import notify
 
             notify("vesktop restored", urgency="low", timeout_ms=3000)

@@ -6,8 +6,6 @@ import argparse
 import logging
 import sys
 
-from .ipc import IpcError
-
 
 def main() -> None:
     """Run the session-manager command line."""
@@ -38,7 +36,11 @@ def main() -> None:
         if args.action == "save":
             from .save import save_session
 
-            save_session(notify_user=not quiet)
+            if not save_session(notify_user=not quiet):
+                # The compositor was unreachable or the file could not be
+                # written. The reason was already reported; the exit code
+                # has to say so too.
+                raise SystemExit(1)
         elif args.action == "restore":
             from .restore import restore_session
 
@@ -46,14 +48,16 @@ def main() -> None:
         elif args.action == "diff":
             from .restore import diff_sessions
 
-            diff_sessions()
+            if not diff_sessions():
+                raise SystemExit(1)
         else:
             from .restore import has_restorable_content
 
             raise SystemExit(0 if has_restorable_content() else 1)
-    except IpcError as exc:
-        # The compositor is not reachable. Say so plainly and exit non-zero
-        # instead of dumping a traceback on the user.
+    except OSError as exc:
+        # The compositor is not reachable, or it stopped answering. Say so
+        # plainly and exit non-zero instead of dumping a traceback on the
+        # user. `IpcError` is an `OSError`, and so is `TimeoutError`.
         print(f"Cannot reach the window manager: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

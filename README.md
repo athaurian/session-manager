@@ -80,12 +80,17 @@ To check whether there is anything to restore without changing the desktop:
 | `save`        | Writes the current desktop to the saved session.                                                                                         |
 | `restore`     | Recreates the saved session on the running desktop.                                                                                      |
 | `has-session` | Exits 0 when the saved session contains anything worth restoring, and 1 otherwise. A login prompt can use this to decide whether to ask. |
-| `diff`        | Prints a plain-English comparison of the live windows and the saved windows, workspace by workspace.                                     |
+| `diff`        | Prints the window counts of the live windows and the saved windows, workspace by workspace.                                              |
 
 | Option          | Applies to        | Effect                                                                                                         |
 | --------------- | ----------------- | -------------------------------------------------------------------------------------------------------------- |
 | `--quiet`       | `save`, `restore` | Suppresses desktop notifications.                                                                              |
 | `--workspace N` | `restore`         | Restores only the workspace whose name matches `N` exactly. The scratchpad and background apps are left alone. |
+
+A filtered restore does not replay the browser's own session, because that
+session holds the windows saved on every other workspace. The browser windows
+of the selected workspace come back blank instead, because the compositor does
+not expose their URLs.
 
 ### State files
 
@@ -97,6 +102,10 @@ Set `XDG_STATE_HOME` to keep the state somewhere else. The three previous
 saves are kept next to the state file as `.1`, `.2`, and `.3`, where `.1` is
 the most recent.
 
+- Background app compatibility output: `sway_session_background_apps.json`,
+  `i3_session_background_apps.json`. `restore` reads these only when the main
+  state file was written before it carried the `background_apps` list.
+
 ## Supported window managers
 
 The tool looks for `SWAYSOCK` or `I3SOCK` first, then for the compositor name
@@ -107,6 +116,10 @@ Set `SESSION_MANAGER_BACKEND` to `sway` or `i3` to force a backend, or
 `SESSION_MANAGER_SOCK` to pin the IPC socket. An explicit backend value wins
 over the detected signals. A compositor binary that supports
 `--get-socketpath` can also provide the socket path.
+
+Set `SWAY_SESSION_IPC_REQUEST_TIMEOUT` to change how long a single IPC
+request waits for a reply, in seconds (default `1.0`). Non-numeric,
+negative, and non-finite values fall back to the default.
 
 ## Running restore at login
 
@@ -130,21 +143,25 @@ i3 and is not supported.
 - Terminals with their working directories, including Neovim sessions inside
   them.
 - Open documents, down to the page of the PDF you were reading in zathura.
-- The browser, relaunched with Helium's `--restore-last-session` flag. A
-  running instance is reused, missing windows are added, and the windows are
-  matched back to the saved ones.
+- The browser. A full restore relaunches Helium with `--restore-last-session`,
+  reuses a running instance when it has enough windows, and matches windows
+  back to the saved ones by title. A scoped `--workspace` restore opens blank
+  windows instead, because the browser does not expose its URLs.
 - Background apps that live in the tray with no visible window, such as a
   minimized Vesktop.
 
 ### Non-restorables
 
-- The dropdown terminal (a hidden terminal summoned by a keybinding) is not
-  counted as saved content, because that keybinding spawns it whenever it is
-  missing.
+- The dropdown terminal (a hidden terminal summoned by a keybinding) is saved,
+  but does not count as restorable content, because that keybinding spawns it
+  whenever it is missing.
 - Transient helper terminals (short-lived terminals opened by scripts) are
   intentionally not saved.
 
 ## Development
+
+The restore design and its invariants are documented in
+[`docs/restore-design.md`](docs/restore-design.md).
 
 The `Makefile` provides these targets:
 

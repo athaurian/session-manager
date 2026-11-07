@@ -7,13 +7,30 @@ import logging
 import re
 import sqlite3
 import subprocess
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import APP_PROFILES, CALIBRE_CONFIG, CALIBRE_DB
 from ..ipc import WindowEventWatcher, matching_window_ids
+from ..proc_cache import ProcCache
 from ._common import reap_if_needed
 
 log = logging.getLogger("session_manager")
+
+# Calibre stores the file name without its extension in `data.name`, so
+# the extension has to be added back to find the file on disk. KEPUB is
+# the one format whose extension is not its name.
+_FORMAT_EXTENSIONS = {"KEPUB": "kepub.epub"}
+
+
+def _library_file_names(name: str, book_fmt: str) -> list[str]:
+    """Return the file names a library entry can have on disk.
+
+    The bare name is kept as well, because an entry may already carry
+    its extension.
+    """
+    ext = _FORMAT_EXTENSIONS.get(book_fmt, book_fmt.lower())
+    return [name, f"{name}.{ext}"]
 
 
 def calibre_title_from_window(name: str) -> tuple[str, str] | None:
@@ -88,11 +105,12 @@ def _resolve_calibre_document_from_library(title: str, fmt: str) -> str | None:
             ):
                 continue
             candidate_dir = Path.home() / "Library" / book_path
-            for variant_name in (name, name.replace(" ", "_")):
-                candidate = candidate_dir / variant_name
-                if candidate.is_file():
-                    candidates.append(str(candidate.resolve()))
-                    break
+            for file_name in _library_file_names(name, book_fmt):
+                for variant_name in (file_name, file_name.replace(" ", "_")):
+                    candidate = candidate_dir / variant_name
+                    if candidate.is_file():
+                        candidates.append(str(candidate.resolve()))
+                        break
 
         unique = sorted({p for p in candidates if Path(p).is_file()})
         if len(unique) == 1:
@@ -114,7 +132,19 @@ def get_ebook_viewer_document(title: str, fmt: str) -> str | None:
     return _resolve_calibre_document_from_library(title, fmt)
 
 
-def launch_ebook_viewer(node: dict, claimed_ids: set[int]) -> int | None:
+def capture_calibre(source: dict, _pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved document for an ebook viewer window."""
+    parsed = calibre_title_from_window(source.get("name", ""))
+    if parsed is None:
+        return {"document_path": "", "calibre_format": ""}
+    title, fmt = parsed
+    return {
+        "document_path": get_ebook_viewer_document(title, fmt) or "",
+        "calibre_format": fmt,
+    }
+
+
+def launch_ebook_viewer(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch the ebook viewer and return its window id."""
     from .generic import wait_for_app_window
 

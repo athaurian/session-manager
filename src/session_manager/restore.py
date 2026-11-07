@@ -5,37 +5,50 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import threading
 import time
+from collections.abc import Iterator
+from functools import partial
 from typing import Any
 
-from .apps.generic import launch_and_get_id
+from .apps.generic import launch_and_get_id, window_with_pid
+from .apps.handlers import handler_for
 from .apps.helium import (
     collect_helium_nodes,
     get_helium_restored_id,
-    start_helium_restore,
+    restore_helium_group,
 )
+from .apps.kitty import classify_kitty
 from .background import restore_background_apps
 from .config import (
+    APP_PROFILES,
+    DEFAULT_APP_PROFILE,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
-    FLOAT_GEOMETRY_RETRY_DELAY,
+    RESTORE_STAGING_WORKSPACE,
     SCRATCH_RESTORE_WORKSPACE,
     SCRATCHPAD_WORKSPACE,
+    STAGING_WORKSPACES,
     STATE_DIR,
     STATE_FILE,
+    canonical_app_id,
     detect_backend,
 )
 from .ipc import (
     close_connection,
     get_tree,
+    is_window_node,
     node_app_id,
+    node_pid,
     run_command,
     run_command_logged,
     walk_tree,
 )
 from .locking import operation_lock
 from .logging_setup import notify
+from .model import Snapshot, StateValidationError
 from .proc_cache import ProcCache
 from .session_env import apply_compositor_env
 from .state import RestoreContext
@@ -45,9 +58,6 @@ log = logging.getLogger("session_manager")
 # Log command failures but never abort the walk. Stale con_id and closed window
 # failures are expected during restore.
 cmd = run_command_logged
-
-# Patched in tests so the geometry settle delay does not slow the suite down.
-sleep = time.sleep
 
 _WORKSPACE_SAFE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
@@ -63,6 +73,17 @@ _LAYOUTS: dict[str, frozenset[str]] = {
     ),
     "sway": frozenset({"default", "stacking", "tabbed", "splitv", "splith", "toggle"}),
 }
+
+# An application asks for its own size right after it maps, and that request
+# can land after the restore placed the window. The tree is polled until the
+# rects stop changing, so the request is seen before the geometry is judged.
+_GEOMETRY_SETTLE_TIMEOUT = 2.0
+_GEOMETRY_POLL_INTERVAL = 0.05
+
+# An application can replace the window that it maps. The restore reads the
+# tree repeatedly until the containers do not change. A container that dies
+# while its process lives is given this time to be replaced.
+_PLACEMENT_SETTLE_TIMEOUT = 2.0
 
 
 def _quote_token(name: str) -> str:
@@ -83,94 +104,24 @@ def _move_to_workspace_cmd(win_id: int, name: str) -> str:
     return f"[con_id={win_id}] move to workspace {_quote_token(name)}"
 
 
-def _rect_number(rect: dict, key: str, default: int) -> int:
-    """Return a rect member as a plain int.
+def _finite_int(value: Any) -> int | None:
+    """Return a value as a plain int, or None when it is not a finite number.
 
-    Only finite numbers are accepted. Everything else falls back to the
-    default, so a malformed state file can never put arbitrary text into a
-    compositor command.
+    Booleans are not numbers here, and NaN or infinity is refused, so a
+    malformed state file can never put arbitrary text into a compositor
+    command.
     """
-    value = rect.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
-    try:
-        if not math.isfinite(value):
-            return default
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(value)
 
 
-class StateValidationError(ValueError):
-    """Raised when the saved restore payload is structurally invalid."""
-
-
-def _require_list(value: Any, path: str) -> list[Any]:
-    """Return a list value, or raise when the type is wrong."""
-    if not isinstance(value, list):
-        raise StateValidationError(f"{path} must be a list")
-    return value
-
-
-def _validate_rect(rect: dict, path: str) -> None:
-    """Reject rect members that are not finite numbers."""
-    for key in ("x", "y", "width", "height"):
-        if key not in rect:
-            continue
-        value = rect[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise StateValidationError(f"{path}.{key} must be a number")
-        if not math.isfinite(value):
-            raise StateValidationError(f"{path}.{key} must be a finite number")
-
-
-def _validate_node(node: Any, path: str) -> None:
-    """Validate a saved tree node and its children."""
-    if not isinstance(node, dict):
-        raise StateValidationError(f"{path} must be an object")
-
-    ntype = node.get("type")
-    if ntype not in ("workspace", "con", "window"):
-        raise StateValidationError(f"{path}.type is invalid or missing")
-
-    if ntype == "window":
-        if "rect" in node and not isinstance(node["rect"], dict):
-            raise StateValidationError(f"{path}.rect must be an object")
-        if isinstance(node.get("rect"), dict):
-            _validate_rect(node["rect"], f"{path}.rect")
-        if "marks" in node:
-            marks = _require_list(node["marks"], f"{path}.marks")
-            if not all(isinstance(mark, str) for mark in marks):
-                raise StateValidationError(f"{path}.marks must contain only strings")
-        if "fullscreen_mode" in node and not isinstance(node["fullscreen_mode"], int):
-            raise StateValidationError(f"{path}.fullscreen_mode must be an integer")
-        if "percent" in node and not isinstance(node["percent"], (int, float)):
-            raise StateValidationError(f"{path}.percent must be a number")
-        if "percent" in node and not math.isfinite(node["percent"]):
-            raise StateValidationError(f"{path}.percent must be a finite number")
-        return
-
-    if ntype == "workspace" and (
-        not isinstance(node.get("name"), str) or not node["name"]
-    ):
-        raise StateValidationError(f"{path}.name must be a non-empty string")
-
-    # Layout is required for workspace/con because _restore_node accesses
-    # node["layout"] unconditionally. clean_tree always emits this key.
-    if ntype in ("workspace", "con"):
-        if "layout" not in node:
-            raise StateValidationError(f"{path}.layout is required")
-        if not isinstance(node["layout"], str):
-            raise StateValidationError(f"{path}.layout must be a string")
-        if "percent" in node and not isinstance(node["percent"], (int, float)):
-            raise StateValidationError(f"{path}.percent must be a number")
-        if "percent" in node and not math.isfinite(node["percent"]):
-            raise StateValidationError(f"{path}.percent must be a finite number")
-
-    for key in ("nodes", "floating_nodes"):
-        children = _require_list(node.get(key, []), f"{path}.{key}")
-        for index, child in enumerate(children):
-            _validate_node(child, f"{path}.{key}[{index}]")
+def _rect_number(rect: dict, key: str, default: int) -> int:
+    """Return a rect member as a plain int, defaulted when it is not one."""
+    value = _finite_int(rect.get(key, default))
+    return default if value is None else value
 
 
 def _normalise_restore_payload(
@@ -179,52 +130,953 @@ def _normalise_restore_payload(
     """Return saved workspaces, scratchpad, background apps, and focus.
 
     Accept both the current object payload and the legacy list of
-    workspaces.
+    workspaces. Nodes that cannot be used are dropped with a warning instead
+    of rejecting the rest of the session.
     """
-    if isinstance(payload, list):
-        workspaces = payload
-        hidden_scratchpad = []
-        background_apps = None
-        focused_workspace = None
-    elif isinstance(payload, dict):
-        workspaces = payload.get("workspaces", [])
-        hidden_scratchpad = payload.get("hidden_scratchpad", [])
-        background_apps = payload.get("background_apps")
-        focused_workspace = payload.get("focused_workspace")
-        if focused_workspace is not None and (
-            not isinstance(focused_workspace, str) or not focused_workspace
-        ):
-            raise StateValidationError("focused_workspace must be a non-empty string")
+    snapshot = Snapshot.from_payload(payload)
+    for issue in snapshot.issues:
+        log.warning("Session payload issue: %s", issue)
+    workspaces = [
+        ws for ws in snapshot.workspaces if ws.get("name") not in STAGING_WORKSPACES
+    ]
+    focused = snapshot.focused_workspace
+    if focused in STAGING_WORKSPACES:
+        focused = None
+    return (
+        workspaces,
+        snapshot.hidden_scratchpad,
+        snapshot.background_apps,
+        focused,
+    )
+
+
+def _iter_windows(node: dict) -> Iterator[dict]:
+    """Yield the windows in a saved subtree, flattening containers."""
+    if node.get("type") == "window":
+        yield node
+        return
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        yield from _iter_windows(child)
+
+
+def _same_app_identity(live: dict, saved: dict) -> bool:
+    """Report whether a live window carries a saved window's app identity."""
+    app_id = saved.get("app_id")
+    if isinstance(app_id, str) and app_id:
+        saved_id = canonical_app_id(app_id)
+        if saved_id == "kitty_drop":
+            # The dropdown is a kitty window with its own instance, title, or
+            # mark. A plain kitty window must not stand in for it, so the
+            # same classifier that saved it decides the match.
+            return classify_kitty(live, node_app_id(live)) == "kitty_drop"
+        return node_app_id(live) == saved_id
+    class_name = saved.get("class")
+    return (
+        isinstance(class_name, str)
+        and bool(class_name)
+        and node_app_id(live) == canonical_app_id(class_name)
+    )
+
+
+def _same_saved_window(live: dict, saved: dict, live_pid: int) -> bool:
+    """Report whether the pid or the exact title also identifies the window.
+
+    App identity alone is not enough, because one session can hold several
+    windows of the same application.
+    """
+    pid = saved.get("pid")
+    if isinstance(pid, int) and pid > 0 and live_pid == pid:
+        return True
+    name = saved.get("name")
+    return isinstance(name, str) and bool(name) and live.get("name") == name
+
+
+def _live_window_nodes(tree: dict) -> list[dict]:
+    """Return the window containers in a live tree."""
+    return [
+        node
+        for node in walk_tree(tree)
+        if node.get("type") in ("con", "floating_con") and is_window_node(node)
+    ]
+
+
+def _adopt_live_windows(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Reuse saved windows that are already live instead of launching them.
+
+    A restore that was interrupted, or one run over a session that is still
+    up, should heal what survived rather than duplicate every window. Each
+    live window is claimed at most once, so two saved windows never resolve
+    to the same one.
+
+    A grouped app is left to its own group restore, which already matches
+    its windows by title.
+    """
+    candidates = [
+        node
+        for node in nodes
+        if handler_for(canonical_app_id(node_app_id(node))).adoptable
+    ]
+    if not candidates:
+        return
+    try:
+        live_windows = _live_window_nodes(get_tree())
+    except OSError as exc:
+        log.info("Cannot read the live tree to reuse windows: %s", exc)
+        return
+
+    # i3 reports no pid on the container, so the X11 lookup runs only for a
+    # window that already matches the app and only once per live window.
+    live_pids: dict[int, int] = {}
+    reused = 0
+    for node in candidates:
+        for live in live_windows:
+            win_id = live["id"]
+            if win_id in ctx.claimed_ids:
+                continue
+            if not _same_app_identity(live, node):
+                continue
+            if win_id not in live_pids:
+                live_pids[win_id] = node_pid(live)
+            if not _same_saved_window(live, node, live_pids[win_id]):
+                continue
+            ctx.claimed_ids.add(win_id)
+            ctx.registry.adopt(node, win_id)
+            reused += 1
+            log.info("Reusing live window %s for %s", win_id, _failure_label(node))
+            break
+    if reused:
+        log.info("Reused %d live window(s) instead of launching them", reused)
+
+
+def _launch_units(nodes: list[dict]) -> list[list[dict]]:
+    """Group saved nodes into independent launch units.
+
+    A unit launches once. Windows matched by pid are independent, so each
+    gets its own unit and they all start together. Windows matched by app
+    identity share one unit per app: two concurrent launches of the same app
+    could otherwise claim each other's window. A grouped app is restored by
+    its own group pass instead.
+    """
+    units: dict[tuple[str, ...], list[dict]] = {}
+    for node in nodes:
+        app_id = canonical_app_id(node_app_id(node))
+        handler = handler_for(app_id)
+        if handler.grouped:
+            continue
+        key: tuple[str, ...]
+        if handler.pid_matched:
+            key = ("node", str(id(node)))
+        else:
+            key = ("app", app_id, str(node.get("class", "")))
+        units.setdefault(key, []).append(node)
+    return list(units.values())
+
+
+def _run_launch_unit(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Launch one unit's windows and record the ids they came back with."""
+    for node in nodes:
+        try:
+            win_id = launch_and_get_id(node, ctx.claimed_ids)
+        except Exception as exc:
+            log.exception("Failed to launch %s", _failure_label(node))
+            ctx.add_failure(f"{_failure_label(node)}: {exc}")
+            win_id = None
+        ctx.registry.record(node, win_id, pid=_launched_window_pid(win_id))
+
+
+def _launched_window_pid(win_id: int | None) -> int | None:
+    """Return the pid of the window that the launch bound.
+
+    The restore must read the pid while the window is in the tree. An
+    application can replace its window. The pid of the replacement window
+    stays the same.
+    """
+    if not win_id:
+        return None
+    try:
+        tree = get_tree()
+    except OSError:
+        return None
+    for node in walk_tree(tree):
+        if node.get("id") != win_id:
+            continue
+        if node.get("type") not in ("con", "floating_con"):
+            return None
+        pid = node_pid(node)
+        return pid if pid > 0 else None
+    return None
+
+
+def _rebind_window(
+    node: dict, win_id: int, pid: int, replacement: int, ctx: RestoreContext
+) -> None:
+    """Bind one saved node to the live window that replaced its window.
+
+    The claim set moves with the bind. Thus no other saved node can claim
+    the replacement window.
+    """
+    ctx.claimed_ids.discard(win_id)
+    ctx.claimed_ids.add(replacement)
+    ctx.registry.rebind(node, replacement)
+    log.info(
+        "Re-bound %s from gone container %d to %d (pid %d)",
+        _failure_label(node),
+        win_id,
+        replacement,
+        pid,
+    )
+
+
+def _await_replacements(
+    pending: dict[int, list[tuple[dict, int]]], ctx: RestoreContext
+) -> int:
+    """Wait for the live processes to map the replacement windows.
+
+    An application can destroy the window that the launch bound. The
+    application maps the window that the session saved a short time later.
+    The replacement window has the same pid.
+
+    The wait stops when one of these conditions occurs:
+      * The process of a pending pid does not live.
+      * The replacement windows are found.
+      * The deadline is reached.
+
+    Args:
+        pending: The live pids and the saved nodes of the dead containers.
+        ctx: The restore context that holds the registry and the claim set.
+
+    Returns:
+        The number of nodes that this function bound again.
+    """
+    deadline = time.monotonic() + _PLACEMENT_SETTLE_TIMEOUT
+    rebound = 0
+    while pending:
+        if not any(_pid_is_alive(pid) for pid in pending):
+            return rebound
+        try:
+            tree = get_tree()
+        except OSError:
+            return rebound
+        for pid in list(pending):
+            remaining: list[tuple[dict, int]] = []
+            for node, win_id in pending[pid]:
+                app_id = canonical_app_id(node_app_id(node))
+                replacement = window_with_pid(pid, app_id, tree)
+                if replacement is None or replacement in ctx.claimed_ids:
+                    remaining.append((node, win_id))
+                    continue
+                _rebind_window(node, win_id, pid, replacement, ctx)
+                rebound += 1
+            if remaining:
+                pending[pid] = remaining
+            else:
+                del pending[pid]
+        if time.monotonic() >= deadline:
+            return rebound
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
+    return rebound
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Report whether the pid names a live process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _rebind_dead_windows(nodes: list[dict], ctx: RestoreContext) -> int:
+    """Bind the saved nodes to the windows that replaced the bound windows.
+
+    An application can map a placeholder window and destroy it. The
+    application maps the window that the session saved under the same pid.
+    The launch wait binds the placeholder. Each later `[con_id=]` command
+    fails with `No matching node.`. The pid that the launch recorded finds
+    the replacement window.
+
+    A container can die a short time before the application maps the
+    replacement. This function waits for those replacements.
+
+    Args:
+        nodes: The saved nodes to bind again.
+        ctx: The restore context that holds the registry and the claim set.
+
+    Returns:
+        The number of nodes that this function bound again.
+    """
+    bound: list[tuple[dict, int, int]] = []
+    for node in nodes:
+        if not ctx.registry.has(node):
+            continue
+        win_id = ctx.registry.resolve(node)
+        pid = ctx.registry.pid(node)
+        if win_id and pid:
+            bound.append((node, win_id, pid))
+    if not bound:
+        return 0
+    try:
+        tree = get_tree()
+    except OSError:
+        return 0
+    live_ids = {
+        node.get("id")
+        for node in walk_tree(tree)
+        if node.get("type") in ("con", "floating_con")
+    }
+    rebound = 0
+    pending: dict[int, list[tuple[dict, int]]] = {}
+    for node, win_id, pid in bound:
+        if win_id in live_ids:
+            continue
+        app_id = canonical_app_id(node_app_id(node))
+        replacement = window_with_pid(pid, app_id, tree)
+        if replacement is None:
+            pending.setdefault(pid, []).append((node, win_id))
+            continue
+        if replacement in ctx.claimed_ids:
+            continue
+        _rebind_window(node, win_id, pid, replacement, ctx)
+        rebound += 1
+    return rebound + _await_replacements(pending, ctx)
+
+
+def _start_materialization(
+    nodes: list[dict], ctx: RestoreContext
+) -> list[threading.Event]:
+    """Start launches for `nodes` and return one completion event per unit."""
+    events: list[threading.Event] = []
+    for unit in _launch_units(nodes):
+        events.append(ctx.registry.submit(unit, partial(_run_launch_unit, unit, ctx)))
+    return events
+
+
+def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
+    """Launch the windows in `nodes`, then wait before anything is placed.
+
+    Windows that were reused from the live tree need no launch. The browser
+    group restores alongside the other launches, and placement still waits
+    for it: a window that maps while the walk is issuing `split` or `layout`
+    can steal focus and reshape the wrong container.
+
+    A window whose container died during the launches is bound to the
+    replacement window before anything is placed. Thus the walk does not
+    place a container id that is already gone.
+    """
+    pending = [node for node in nodes if not ctx.registry.has(node)]
+    helium = _start_helium_materialization(ctx)
+    events = _start_materialization(pending, ctx)
+    for event in events:
+        event.wait()
+    if helium is not None:
+        helium.wait()
+    _rebind_dead_windows(nodes, ctx)
+
+
+def _run_helium_unit(ctx: RestoreContext) -> None:
+    """Restore the saved browser group and publish each window's id."""
+    try:
+        restore_helium_group(ctx)
+    except Exception:
+        log.exception("Helium restore failed")
+    finally:
+        for idx, node in enumerate(ctx.helium_saved_nodes):
+            ctx.registry.record(node, ctx.helium_restored_ids[idx])
+
+
+def _start_helium_materialization(ctx: RestoreContext) -> threading.Event | None:
+    """Start the browser group restore alongside the other launches.
+
+    Returns the event that is set once the group has published its ids, or
+    None when there is no saved browser window.
+    """
+    if ctx.helium_materialized or not ctx.helium_saved_nodes:
+        return None
+    ctx.helium_materialized = True
+    return ctx.registry.submit(
+        list(ctx.helium_saved_nodes), partial(_run_helium_unit, ctx)
+    )
+
+
+def _window_workspace_name(win_id: int) -> str | None:
+    """Return the name of the workspace holding a live window."""
+    try:
+        tree = get_tree()
+    except OSError:
+        return None
+
+    def _find(node: dict, workspace: str | None) -> str | None:
+        if node.get("type") == "workspace":
+            name = node.get("name")
+            workspace = name if isinstance(name, str) else None
+        if node.get("id") == win_id:
+            return workspace
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = _find(child, workspace)
+            if found is not None:
+                return found
+        return None
+
+    return _find(tree, None)
+
+
+def _focused_depth_in_workspace(name: str, tree: dict | None) -> int | None:
+    """Return how many `focus parent` steps reach a workspace root.
+
+    None means the workspace is not in the live tree, so the caller should
+    fall back to a best-effort single step.
+    """
+    if tree is None:
+        return None
+
+    def find_workspace(node: dict) -> dict | None:
+        """Find the workspace with the given name."""
+        if node.get("type") == "workspace" and node.get("name") == name:
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = find_workspace(child)
+            if found is not None:
+                return found
+        return None
+
+    def focused_depth(node: dict, depth: int) -> int | None:
+        """Return the depth of the focused node inside this subtree."""
+        if node.get("focused"):
+            return depth
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            found = focused_depth(child, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    workspace = find_workspace(tree)
+    if workspace is None:
+        return None
+    depth = focused_depth(workspace, 0)
+    # An empty workspace is itself focused, which is already the root.
+    return 0 if depth is None else depth
+
+
+def _focus_workspace_root(name: str, tree: dict | None) -> None:
+    """Focus a workspace container so the next window lands at its root.
+
+    Switching to a workspace focuses its last focused child. Without this, a
+    window placed after a nested container would be moved inside that
+    container instead of beside it. Workspaces cannot be focused by con_id,
+    so walk up from the focused child instead.
+    """
+    depth = _focused_depth_in_workspace(name, tree)
+    if depth is None:
+        run_command("focus parent")
+        return
+    for _ in range(depth):
+        cmd("focus parent")
+
+
+def _read_tree(ctx: RestoreContext) -> dict | None:
+    """Read the live tree and cache the window placements it holds.
+
+    The arrangement asks the tree two questions per window: how deep the
+    focus is, and which workspace a window is on. One read answers both,
+    so the walk does not cost an IPC round trip per question.
+    """
+    try:
+        tree = get_tree()
+    except OSError:
+        ctx.placements = None
+        return None
+    ctx.placements = _live_window_placements(tree)
+    return tree
+
+
+def _ensure_on_workspace(
+    win_id: int, workspace: str | None, ctx: RestoreContext
+) -> None:
+    """Move a window to the workspace being restored, if it is elsewhere.
+
+    Placement must never depend on which workspace happens to be focused when
+    an application maps its window. The caller names the target explicitly.
+    """
+    if not workspace:
+        return
+    if ctx.placements is not None:
+        current = ctx.placements.get(win_id)
     else:
-        raise StateValidationError("session payload must be an object or legacy list")
+        current = _window_workspace_name(win_id)
+    if current == workspace:
+        return
+    cmd(_move_to_workspace_cmd(win_id, workspace))
+    cmd(_workspace_cmd(workspace))
+    if ctx.placements is not None:
+        ctx.placements[win_id] = workspace
 
-    workspace_list = _require_list(workspaces, "workspaces")
-    scratchpad_list = _require_list(hidden_scratchpad, "hidden_scratchpad")
 
-    for index, ws in enumerate(workspace_list):
-        _validate_node(ws, f"workspaces[{index}]")
-        if ws.get("type") != "workspace":
-            raise StateValidationError(f"workspaces[{index}] must be a workspace")
+def _park_in_scratchpad(win_id: int, node: dict, ctx: RestoreContext) -> None:
+    """Hide a window in the scratchpad and verify that it left the desktop.
 
-    for index, node in enumerate(scratchpad_list):
-        _validate_node(node, f"hidden_scratchpad[{index}]")
-        if node.get("type") != "window":
-            raise StateValidationError(f"hidden_scratchpad[{index}] must be a window")
+    Every move is followed by a check, so the last move is verified too. A
+    window that is no longer in the tree cannot be verified, and that is
+    reported rather than counted as a successful park.
+    """
+    for attempt in range(3):
+        cmd(f"[con_id={win_id}] move scratchpad")
+        workspace = _window_workspace_name(win_id)
+        if workspace == SCRATCHPAD_WORKSPACE:
+            return
+        if workspace is None:
+            # The window is not in the tree, so the park cannot be verified.
+            ctx.add_failure(
+                f"{_failure_label(node)}: window vanished before it was parked"
+            )
+            return
+        if attempt < 2:
+            time.sleep(0.05)
+    ctx.add_failure(f"{_failure_label(node)}: still visible after move scratchpad")
 
-    if background_apps is not None:
-        apps = _require_list(background_apps, "background_apps")
-        for index, app in enumerate(apps):
-            if not isinstance(app, dict):
-                raise StateValidationError(
-                    f"background_apps[{index}] must be an object"
-                )
-            if "app_id" in app and not isinstance(app["app_id"], str):
-                raise StateValidationError(
-                    f"background_apps[{index}].app_id must be a string"
-                )
-        background_apps = apps
 
-    return workspace_list, scratchpad_list, background_apps, focused_workspace
+def _live_window_placements(tree: dict) -> dict[int, str | None]:
+    """Map every live window id to the workspace that holds it."""
+    placements: dict[int, str | None] = {}
+
+    def walk(node: dict, workspace: str | None) -> None:
+        """Collect window ids with the workspace they sit in."""
+        if node.get("type") == "workspace":
+            name = node.get("name")
+            workspace = name if isinstance(name, str) else None
+        if (
+            node.get("type") in ("con", "floating_con")
+            and is_window_node(node)
+            and node.get("id") is not None
+        ):
+            placements[node["id"]] = workspace
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(child, workspace)
+
+    walk(tree, None)
+    return placements
+
+
+def _placed_window_id(node: dict, ctx: RestoreContext) -> int | None:
+    """Return the live id of a saved node that went through materialization."""
+    if not ctx.registry.has(node):
+        return None
+    return ctx.registry.resolve(node)
+
+
+def _reconcile_placements(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> None:
+    """Move restored windows that drifted back to where they were saved.
+
+    Placement is asserted during the walk, but an application can move its
+    own window afterwards, and a window can map after its workspace was
+    arranged. One pass over the live tree repairs those windows by con id
+    and verifies the repair, so a partly healed session converges instead of
+    reporting success with windows in the wrong place.
+
+    The pass also binds a saved node again when its container died. An
+    application can replace its window at any time. The window that is in
+    the tree is the window that the pass must put back. If the pass does not
+    bind the node again, the saved window is reported as missing. The
+    replacement window stays on a different workspace. The rebind runs
+    before the pass reads the placements. Thus the pass judges the window
+    that is in the tree.
+    """
+    saved_windows = [
+        window for workspace in workspaces for window in _iter_windows(workspace)
+    ]
+    saved_windows.extend(
+        window for node in hidden_scratchpad for window in _iter_windows(node)
+    )
+    _rebind_dead_windows(saved_windows, ctx)
+    try:
+        tree = get_tree()
+    except OSError:
+        ctx.placements = None
+        return
+    # The reconcile pass works from a fresh tree, so the cached
+    # placements have to match it.
+    ctx.placements = placements = _live_window_placements(tree)
+
+    moved: dict[int, tuple[dict, str]] = {}
+    for workspace in workspaces:
+        name = workspace.get("name")
+        if not isinstance(name, str):
+            continue
+        for node in _iter_windows(workspace):
+            win_id = _placed_window_id(node, ctx)
+            if win_id is None:
+                continue
+            if win_id not in placements:
+                _record_missing(ctx, node)
+                continue
+            if placements[win_id] == name:
+                continue
+            _ensure_on_workspace(win_id, name, ctx)
+            moved[win_id] = (node, name)
+
+    for node in hidden_scratchpad:
+        for window in _iter_windows(node):
+            win_id = _placed_window_id(window, ctx)
+            if win_id is None:
+                continue
+            if win_id not in placements:
+                _record_missing(ctx, window)
+                continue
+            if placements[win_id] == SCRATCHPAD_WORKSPACE:
+                continue
+            _park_in_scratchpad(win_id, window, ctx)
+
+    if not moved:
+        return
+    try:
+        after = _live_window_placements(get_tree())
+    except OSError:
+        return
+    for win_id, (node, name) in moved.items():
+        if win_id not in after:
+            # The window closed after the move; whatever was lost is already
+            # reported as missing or failed.
+            continue
+        if after[win_id] != name:
+            ctx.add_failure(
+                f"{_failure_label(node)}: still on workspace {after[win_id]!r}, "
+                f"expected {name!r}"
+            )
+    log.info("Reconciled %d misplaced window(s)", len(moved))
+
+
+def _app_settle(node: dict) -> float:
+    """Return the settle time of the application that owns the node.
+
+    Returns:
+        The time in seconds that a mapped window of this application must
+        stay in the tree before the launch wait accepts it.
+    """
+    profile = APP_PROFILES.get(canonical_app_id(node_app_id(node)), DEFAULT_APP_PROFILE)
+    return float(profile["settle"])
+
+
+def _young_windows(placed: list[tuple[dict, int]], ctx: RestoreContext) -> bool:
+    """Report whether a placed window was bound recently.
+
+    An application can replace a window a short time after it maps the
+    window. A young window is given two times its settle time before the
+    restore asserts the placement. Thus the restore sees the replacement.
+
+    A window that the restore adopted is not young. Its application is past
+    the time when it can replace the window.
+
+    Args:
+        placed: The saved nodes and the ids of their live windows.
+        ctx: The restore context that holds the registry.
+
+    Returns:
+        True when a placed window is still young.
+    """
+    for node, _win_id in placed:
+        age = ctx.registry.age(node)
+        if age is None:
+            continue
+        if age < 2 * _app_settle(node):
+            return True
+    return False
+
+
+def _await_stable_placements(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> None:
+    """Wait until the containers of the restored windows do not change.
+
+    An application can replace the window that the walk placed. A placement
+    that the restore asserts before the replacement can be wrong. This
+    function reads the live ids of the placed windows repeatedly. It stops
+    when two reads agree and when no window is young.
+
+    The wait has a deadline. The wait stops immediately when the restore
+    placed no window. The caller keeps the focus on the staging workspace.
+    Thus a window that maps during the wait can be recovered from there.
+
+    Args:
+        workspaces: The saved workspaces of this restore.
+        hidden_scratchpad: The saved scratchpad entries of this restore.
+        ctx: The restore context that holds the registry.
+    """
+    placed = [
+        (node, win_id)
+        for node, _workspace, _floating in _saved_window_targets(
+            workspaces, hidden_scratchpad
+        )
+        if (win_id := _placed_window_id(node, ctx)) is not None
+    ]
+    if not placed:
+        return
+    deadline = time.monotonic() + _PLACEMENT_SETTLE_TIMEOUT
+    previous: tuple[int, ...] | None = None
+    while True:
+        try:
+            tree = get_tree()
+        except OSError:
+            return
+        live_ids = {
+            node.get("id")
+            for node in walk_tree(tree)
+            if node.get("type") in ("con", "floating_con")
+        }
+        state = tuple(win_id for _node, win_id in placed if win_id in live_ids)
+        if (
+            previous is not None
+            and state == previous
+            and not _young_windows(placed, ctx)
+        ):
+            return
+        previous = state
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
+
+
+def _saved_window_targets(
+    workspaces: list[dict], hidden_scratchpad: list[dict]
+) -> list[tuple[dict, str | None, bool]]:
+    """Return every saved window with its target workspace and float state."""
+    targets: list[tuple[dict, str | None, bool]] = []
+
+    def collect(node: dict, workspace: str | None, floating: bool) -> None:
+        """Collect windows under a saved node, tracking float membership."""
+        if node.get("type") == "window":
+            targets.append((node, workspace, floating))
+            return
+        for child in node.get("nodes", []):
+            collect(child, workspace, floating)
+        for child in node.get("floating_nodes", []):
+            collect(child, workspace, True)
+
+    for workspace in workspaces:
+        name = workspace.get("name")
+        if isinstance(name, str):
+            collect(workspace, name, False)
+    for node in hidden_scratchpad:
+        collect(node, None, True)
+    return targets
+
+
+def _staging_workspace_names() -> list[str]:
+    """Return the staging workspaces that are still in the live tree."""
+    try:
+        tree = get_tree()
+    except OSError:
+        return []
+    return [
+        node["name"]
+        for node in walk_tree(tree)
+        if node.get("type") == "workspace" and node.get("name") in STAGING_WORKSPACES
+    ]
+
+
+def _place_recovered_window(
+    node: dict, win_id: int, workspace: str | None, floating: bool, ctx: RestoreContext
+) -> None:
+    """Place a window that mapped after its launch wait gave up."""
+    if workspace is None:
+        _restore_hidden_scratchpad(node, ctx)
+        return
+    previous = ctx.current_workspace
+    ctx.current_workspace = workspace
+    try:
+        if floating:
+            _restore_floating(node, ctx)
+        else:
+            _restore_node(node, ctx)
+    finally:
+        ctx.current_workspace = previous
+
+
+def _late_window_candidates(
+    tree: dict, placements: dict[int, str | None], workspaces: list[dict]
+) -> tuple[list[dict], list[tuple[dict, str | None]]]:
+    """Return the live windows the recovery pass has to consider.
+
+    Windows still on a staging workspace and windows already on a restored
+    workspace are both candidates: the geometry correction briefly focuses a
+    restored workspace, so a window that maps during that short interval can
+    land there instead of on staging. Only the staging ones are swept at the
+    end, so an unrelated window on a restored workspace is left alone.
+
+    Args:
+        tree: The live tree to read.
+        placements: Each live window id and the workspace holding it.
+        workspaces: The saved workspaces being restored.
+
+    Returns:
+        The live staging windows and every candidate with the workspace it
+        currently sits on.
+    """
+    windows = {node["id"]: node for node in _live_window_nodes(tree)}
+    target_names = {
+        workspace["name"]
+        for workspace in workspaces
+        if isinstance(workspace.get("name"), str)
+    }
+    staged: list[dict] = []
+    candidates: list[tuple[dict, str | None]] = []
+    for win_id, workspace in placements.items():
+        live = windows.get(win_id)
+        if live is None:
+            continue
+        if workspace in STAGING_WORKSPACES:
+            staged.append(live)
+            candidates.append((live, workspace))
+        elif workspace in target_names:
+            candidates.append((live, workspace))
+    return staged, candidates
+
+
+def _recover_late_windows(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> int:
+    """Adopt windows that mapped after their launch wait timed out.
+
+    A slow application can create its window after the wait has already
+    reported it missing. The window still belongs to this restore, so it is
+    matched to its saved node, placed, and removed from the missing list.
+    A window is only matched when its pid or its exact title identifies it
+    as well, so one window of an application cannot stand in for another.
+
+    Staging workspaces and the restored workspaces are both searched. The
+    geometry correction briefly focuses a restored workspace, so a window
+    that maps during that short interval can land there instead of on
+    staging. Unmatched windows on restored workspaces are left alone; only
+    unmatched staging windows are reported and moved out of the way.
+    """
+    # The recovery pass works from a fresh tree, so the cached placements
+    # have to match it: `_read_tree` refreshes them from the same read.
+    tree = _read_tree(ctx)
+    placements = ctx.placements
+    if tree is None or placements is None:
+        return 0
+    staged, candidates = _late_window_candidates(tree, placements, workspaces)
+    if not candidates:
+        return 0
+
+    targets = _saved_window_targets(workspaces, hidden_scratchpad)
+    pending = [
+        target
+        for target in targets
+        if _placed_window_id(target[0], ctx) not in placements
+    ]
+    associated = {
+        placed_id
+        for node, _workspace, _floating in targets
+        if (placed_id := _placed_window_id(node, ctx)) is not None
+    }
+
+    used: set[int] = set()
+    live_pids: dict[int, int] = {}
+    recovered = 0
+    for live, live_workspace in candidates:
+        win_id = live["id"]
+        if win_id in ctx.claimed_ids or win_id in associated:
+            continue
+        match: tuple[dict, str | None, bool] | None = None
+        for target in pending:
+            node = target[0]
+            if id(node) in used:
+                continue
+            if not _same_app_identity(live, node):
+                continue
+            # A hidden window belongs in the scratchpad, not on a restored
+            # workspace. A visible window on one of those workspaces cannot
+            # stand in for it.
+            if target[1] is None and live_workspace not in STAGING_WORKSPACES:
+                continue
+            # The pid or the exact title has to identify the window too.
+            # App identity alone would let one window of an application
+            # stand in for another one.
+            if win_id not in live_pids:
+                live_pids[win_id] = node_pid(live)
+            if not _same_saved_window(live, node, live_pids[win_id]):
+                continue
+            match = target
+            break
+        if match is None:
+            continue
+        node, workspace, floating = match
+        used.add(id(node))
+        associated.add(win_id)
+        ctx.claimed_ids.add(win_id)
+        ctx.registry.adopt(node, win_id)
+        ctx.discard_missing(_failure_label(node))
+        try:
+            _place_recovered_window(node, win_id, workspace, floating, ctx)
+        except Exception as exc:
+            log.exception("Failed to place recovered %s", _failure_label(node))
+            ctx.add_failure(f"{_failure_label(node)}: {exc}")
+        recovered += 1
+        log.info("Recovered late window %s for %s", win_id, _failure_label(node))
+
+    fallback = next(
+        (
+            workspace["name"]
+            for workspace in workspaces
+            if isinstance(workspace.get("name"), str)
+        ),
+        "1",
+    )
+    for live in staged:
+        win_id = live["id"]
+        if win_id in associated:
+            continue
+        label = str(live.get("name") or node_app_id(live) or win_id)
+        ctx.add_failure(f"{label}: restored window did not match a saved window")
+        _ensure_on_workspace(win_id, fallback, ctx)
+
+    if recovered:
+        log.info("Recovered %d late window(s)", recovered)
+    return recovered
+
+
+def _finish_staging(
+    workspaces: list[dict],
+    hidden_scratchpad: list[dict],
+    ctx: RestoreContext,
+    destination: str,
+) -> bool:
+    """Leave the staging workspaces and sweep anything that mapped late.
+
+    Visible windows are focused back onto staging before the sweep, so a
+    window that maps while it is running lands on the staging workspace and
+    is found there instead of on the destination. The sweep runs before the
+    switch to the destination.
+
+    The restored windows are first given time to stop the changes to the
+    containers. An application can replace a placed window a short time
+    after the walk places it. The passes that follow assert the placement of
+    the window that is in the tree. They run on each restore. A staging
+    workspace that is already empty is not a cause to skip the last
+    assertion.
+    """
+    # `_iter_windows` is a generator, so `any` has to see the windows it
+    # yields rather than the (always truthy) generator objects themselves.
+    if any(list(_iter_windows(workspace)) for workspace in workspaces):
+        _focus_staging(ctx)
+    _await_stable_placements(workspaces, hidden_scratchpad, ctx)
+    # The reconciliation runs before the recovery. A window whose container
+    # died is bound to the replacement first. Thus the sweep does not report
+    # it as a window that matches no saved window.
+    _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+    _recover_late_windows(workspaces, hidden_scratchpad, ctx)
+    focused = cmd(_workspace_cmd(destination))
+    if not focused:
+        ctx.add_failure(f"could not focus destination workspace {destination!r}")
+    remaining = _staging_workspace_names()
+    if remaining:
+        ctx.add_failure(f"staging workspace not removed: {', '.join(remaining)}")
+    return focused
 
 
 def has_restorable_content() -> bool:
@@ -244,12 +1096,20 @@ def has_restorable_content() -> bool:
         workspaces, hidden_scratchpad, background_apps, _ = _normalise_restore_payload(
             payload
         )
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         log.warning("Session file %s not restorable: %s", STATE_FILE, exc)
         return False
 
     restorable_scratchpad = [
-        node for node in hidden_scratchpad if node.get("app_id") != "kitty_drop"
+        window
+        for node in hidden_scratchpad
+        for window in _iter_windows(node)
+        if window.get("app_id") != "kitty_drop"
     ]
     return bool(workspaces or restorable_scratchpad or background_apps)
 
@@ -311,7 +1171,9 @@ def _output_rect_for(tree: dict, rect: dict, workspace_name: str | None) -> dict
     return outputs[0]
 
 
-def _clamp_rect_to_output(rect: dict, workspace_name: str | None = None) -> dict:
+def _clamp_rect_to_output(
+    rect: dict, workspace_name: str | None, tree: dict | None = None
+) -> dict:
     """Clamp the floating rect to stay fully inside the output when off-screen.
 
     Saved rects are output-absolute (for example, workspace 1 content can
@@ -326,13 +1188,17 @@ def _clamp_rect_to_output(rect: dict, workspace_name: str | None = None) -> dict
         workspace_name: Workspace the rect belongs to. It names the output
             to clamp against when the rect itself sits outside every
             output.
+        tree: The live tree to clamp against. It is read when it is not
+            given, so a caller that already holds one does not pay for a
+            second round trip.
 
     Returns:
-        The clamped rect, or the original rect when clamping is
-        impossible.
+        A complete rect: clamped to the output when clamping is possible,
+        and the rect as given otherwise.
     """
     try:
-        tree = get_tree()
+        if tree is None:
+            tree = get_tree()
         target_rect = _output_rect_for(tree, rect, workspace_name)
         if not target_rect:
             target_rect = {"x": 0, "y": 0, "width": 1920, "height": 1080}
@@ -362,7 +1228,8 @@ def _clamp_rect_to_output(rect: dict, workspace_name: str | None = None) -> dict
             )
             return {"x": clamped_x, "y": clamped_y, "width": w, "height": h}
         return rect
-    except (OSError, ValueError, KeyError):
+    except OSError:
+        # The compositor is unreachable, so the rect is used as saved.
         return rect
 
 
@@ -441,7 +1308,9 @@ def _apply_sway_geometry(win_id: int, rect: dict, workspace_name: str | None) ->
 
     Sway anchors `move position` on the decoration and budgets the titlebar
     inside the height passed to `resize set`. Add the measured decoration
-    height back so the saved content rect is restored exactly.
+    height back so the saved content rect is restored exactly. The height is
+    measured from the tree at apply time, so a correction sees the window as
+    it is now rather than as it was when the restore last read the tree.
 
     Args:
         win_id: Sway container id of the window.
@@ -461,7 +1330,7 @@ def _apply_sway_geometry(win_id: int, rect: dict, workspace_name: str | None) ->
     cmd(f"[con_id={win_id}] move position {x} {y}")
 
 
-def _apply_geometry(win_id: int, rect: dict, workspace_name: str | None = None) -> None:
+def _apply_geometry(win_id: int, rect: dict, workspace_name: str | None) -> None:
     """Apply saved geometry to a window, clamped to its output."""
     rect = _clamp_rect_to_output(rect, workspace_name)
     backend = detect_backend()
@@ -478,14 +1347,342 @@ def _apply_geometry(win_id: int, rect: dict, workspace_name: str | None = None) 
         cmd(f"[con_id={win_id}] move position {x} {y}")
         return
 
-    # A newly started window can ask Sway for its own size after the resize
-    # and undo it. It may also lack a titlebar until it settles, so the
-    # decoration height cannot be measured yet. Apply the geometry again
-    # after the delay to cover both cases. i3 applies geometry directly and
-    # returns above without waiting.
+    # Windows are launched and mapped before the walk places them, and the
+    # app-matched waits hold the window until it settles, so the geometry
+    # can be applied during the walk. A later verification pass catches an
+    # application that overrides its size after this request. i3 applies
+    # geometry directly and returns above.
     _apply_sway_geometry(win_id, rect, workspace_name)
-    sleep(FLOAT_GEOMETRY_RETRY_DELAY)
-    _apply_sway_geometry(win_id, rect, workspace_name)
+
+
+def _live_rects(tree: dict) -> dict[int, dict]:
+    """Map every live container id to the rect it occupies."""
+    return {
+        node["id"]: node["rect"]
+        for node in walk_tree(tree)
+        if isinstance(node.get("id"), int) and isinstance(node.get("rect"), dict)
+    }
+
+
+def _live_window_types(tree: dict) -> dict[int, str]:
+    """Map every live window id to its Sway container type."""
+    return {node["id"]: str(node.get("type", "")) for node in _live_window_nodes(tree)}
+
+
+def _live_window_state(
+    tree: dict,
+) -> tuple[dict[int, dict], dict[int, str | None], dict[int, str]]:
+    """Return the live rects, workspace placements, and container types.
+
+    The geometry waits ask one tree read for all three, so they are derived
+    together here instead of each caller repeating the three lines.
+    """
+    return (
+        _live_rects(tree),
+        _live_window_placements(tree),
+        _live_window_types(tree),
+    )
+
+
+def _normalised_rect(rect: dict) -> dict:
+    """Return a complete rect using the same defaults as geometry restore."""
+    return {
+        "x": _rect_number(rect, "x", 0),
+        "y": _rect_number(rect, "y", 0),
+        "width": _rect_number(rect, "width", DEFAULT_WINDOW_WIDTH),
+        "height": _rect_number(rect, "height", DEFAULT_WINDOW_HEIGHT),
+    }
+
+
+def _rect_value(rect: dict, key: str) -> int | None:
+    """Return a rect member as an int, or None when it is not a number."""
+    return _finite_int(rect.get(key))
+
+
+def _rect_matches(live: dict, expected: dict) -> bool:
+    """Report whether a live rect is the rect that was saved."""
+    keys = ("x", "y", "width", "height")
+    live_values = [_rect_value(live, key) for key in keys]
+    if any(value is None for value in live_values):
+        return False
+    return live_values == [_rect_value(expected, key) for key in keys]
+
+
+def _settled_tree(
+    targets: list[tuple[dict, int, str, dict]], deadline: float
+) -> tuple[dict | None, bool]:
+    """Read the live tree until the target windows stop changing.
+
+    An application asks for its own size right after it maps, and that request
+    can land after the restore placed the window. Two consecutive target
+    states that agree mean the request has been applied, so the rect can be
+    compared with the saved one instead of with a value that is about to
+    change. Unrelated layout churn does not hold up this wait.
+
+    Args:
+        targets: The saved windows and their live ids to observe.
+        deadline: The monotonic time after which the tree is returned as it
+            is.
+
+    Returns:
+        The last tree that was read and whether the target state settled.
+        The tree is None when it cannot be read before the deadline.
+    """
+    previous: tuple[tuple[int, tuple[int | None, ...], str | None, str], ...] | None = (
+        None
+    )
+    while True:
+        try:
+            tree = get_tree()
+        except OSError:
+            if time.monotonic() >= deadline:
+                return None, False
+            time.sleep(_GEOMETRY_POLL_INTERVAL)
+            continue
+        rects, placements, types = _live_window_state(tree)
+        state = tuple(
+            (
+                win_id,
+                tuple(
+                    _rect_value(rects.get(win_id, {}), key)
+                    for key in ("x", "y", "width", "height")
+                ),
+                placements.get(win_id),
+                types.get(win_id, ""),
+            )
+            for _node, win_id, _workspace, _expected in targets
+        )
+        if previous is not None and state == previous:
+            return tree, True
+        previous = state
+        if time.monotonic() >= deadline:
+            return tree, False
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
+
+
+def _wait_for_floating_geometry(
+    targets: list[tuple[dict, int, str, dict]], deadline: float
+) -> tuple[dict[int, dict], dict[int, str | None], dict[int, str], bool]:
+    """Wait until every target has its expected rect and workspace.
+
+    Two consecutive matching reads are required so a transient tree value is
+    not mistaken for the final state. The state read last is returned with a
+    flag saying whether that final read succeeded, so the caller must treat
+    the maps as unverified while the flag is unset.
+    """
+    last_rects: dict[int, dict] = {}
+    last_placements: dict[int, str | None] = {}
+    last_types: dict[int, str] = {}
+    previous_matched = False
+    while True:
+        readable = True
+        matched = False
+        try:
+            tree = get_tree()
+        except OSError:
+            readable = False
+            tree = None
+        if tree is not None:
+            last_rects, last_placements, last_types = _live_window_state(tree)
+            matched = True
+            for _node, win_id, workspace, expected in targets:
+                live = last_rects.get(win_id)
+                if (
+                    live is None
+                    or not _rect_matches(live, expected)
+                    or last_placements.get(win_id) != workspace
+                    or last_types.get(win_id) != "floating_con"
+                ):
+                    matched = False
+                    break
+            if matched and previous_matched:
+                return last_rects, last_placements, last_types, True
+            previous_matched = matched
+        else:
+            previous_matched = False
+
+        if time.monotonic() >= deadline:
+            if matched:
+                # Give a first matching observation one confirmation read,
+                # even when it arrived at the deadline.
+                continue
+            return last_rects, last_placements, last_types, readable
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
+
+
+def _focus_staging(ctx: RestoreContext) -> bool:
+    """Focus the restore staging workspace without masking an active error."""
+    try:
+        focused = cmd(_workspace_cmd(RESTORE_STAGING_WORKSPACE))
+    except Exception as exc:
+        log.exception("Failed to focus the restore staging workspace")
+        ctx.add_failure(f"could not focus staging workspace: {exc}")
+        return False
+    if not focused:
+        ctx.add_failure("could not focus staging workspace")
+    return focused
+
+
+def _verify_floating_geometry(workspaces: list[dict], ctx: RestoreContext) -> None:
+    """Check the saved floating geometry against the live tree.
+
+    An application asks for its own size right after it maps, and that request
+    can land after the restore placed the window. The live rect is therefore
+    read back once the target windows have settled. The saved geometry is
+    always applied once more after that wait, then the result is polled until
+    the expected rect and workspace are observed twice in a row. This closes
+    the window in which a late application request can override the restore.
+
+    Sway applies ``move position`` in the focused workspace. The target
+    workspace is therefore always focused before the geometry is reapplied.
+    Focus then returns to staging, where late windows can still be recovered.
+    The caller performs the final recovery and reconciliation before it
+    leaves staging and restores the requested destination focus.
+
+    i3 is left out: its tree reports the frame rect, which carries the
+    titlebar and the border, so it cannot be compared with the size the
+    restore asks for.
+    """
+    if detect_backend() == "i3":
+        return
+    targets: list[tuple[dict, int, str, dict]] = []
+    # Hidden scratchpad windows are parked rather than placed on a
+    # workspace, so they carry no live rect to compare against.
+    for node, workspace, floating in _saved_window_targets(workspaces, []):
+        if not floating or workspace is None:
+            continue
+        # The dropdown terminal is saved, but it is not floating restorable
+        # content and has no geometry contract to verify.
+        if canonical_app_id(node_app_id(node)) == "kitty_drop":
+            continue
+        # A fullscreen window fills its output, so its live rect is not the
+        # saved one.
+        if node.get("fullscreen_mode", 0):
+            continue
+        win_id = _placed_window_id(node, ctx)
+        if win_id is None:
+            continue
+        saved = node.get("rect", {})
+        targets.append((node, win_id, workspace, saved))
+    if not targets:
+        return
+
+    # Keep late mappings on staging while the application settles. The
+    # final recovery pass can then find and place those windows.
+    if not _focus_staging(ctx):
+        return
+    tree, stable = _settled_tree(targets, time.monotonic() + _GEOMETRY_SETTLE_TIMEOUT)
+    if tree is None:
+        ctx.add_failure(
+            "floating geometry could not be verified: live tree unavailable"
+        )
+        return
+    if not stable:
+        ctx.add_failure("floating geometry did not settle")
+        return
+    live_rects = _live_rects(tree)
+    placements = _live_window_placements(tree)
+    live_types = _live_window_types(tree)
+    ctx.placements = placements
+
+    to_apply: list[tuple[dict, int, str, dict]] = []
+    for node, win_id, workspace, saved in targets:
+        live = live_rects.get(win_id)
+        if win_id not in placements:
+            _record_missing(ctx, node)
+            continue
+        if live is None:
+            ctx.add_failure(f"{_failure_label(node)}: geometry is unavailable")
+            continue
+        if live_types.get(win_id) != "floating_con":
+            ctx.add_failure(f"{_failure_label(node)}: window is not floating")
+            continue
+        clamped = _clamp_rect_to_output(_normalised_rect(saved), workspace, tree=tree)
+        to_apply.append((node, win_id, workspace, clamped))
+
+    if not to_apply:
+        return
+
+    by_workspace: dict[str, list[tuple[dict, int, str, dict]]] = {}
+    for target in to_apply:
+        by_workspace.setdefault(target[2], []).append(target)
+
+    applied: list[tuple[dict, int, str, dict]] = []
+    for workspace, group in by_workspace.items():
+        # `move position` acts in the focused workspace. Focus the target
+        # even when it is also the requested destination. If the switch
+        # fails, applying the move could relocate the window to the wrong
+        # workspace, so the group is not changed. A dropped connection is
+        # one of those failures: the restore has to keep going so staging
+        # is still swept and the destination still ends up focused.
+        try:
+            focused = cmd(_workspace_cmd(workspace))
+        except OSError:
+            log.exception("Failed to focus workspace %r", workspace)
+            focused = False
+        if not focused:
+            for node, _win_id, _workspace, _expected in group:
+                ctx.add_failure(
+                    f"{_failure_label(node)}: could not focus workspace "
+                    f"{workspace!r} to restore its geometry"
+                )
+            continue
+        try:
+            for node, win_id, target_workspace, expected in group:
+                try:
+                    if placements.get(win_id) != target_workspace:
+                        _ensure_on_workspace(win_id, target_workspace, ctx)
+                    log.info(
+                        "Reapplying the saved geometry of %s: %s -> %s",
+                        _failure_label(node),
+                        live_rects.get(win_id),
+                        expected,
+                    )
+                    _apply_sway_geometry(win_id, expected, target_workspace)
+                except OSError as exc:
+                    # Report the window and keep the loop going: the other
+                    # groups and the final sweep still have to run.
+                    log.exception(
+                        "Failed to reapply the geometry of %s", _failure_label(node)
+                    )
+                    ctx.add_failure(f"{_failure_label(node)}: {exc}")
+                    continue
+                applied.append((node, win_id, target_workspace, expected))
+        finally:
+            _focus_staging(ctx)
+
+    if not applied:
+        return
+    after_rects, after_placements, after_types, readable = _wait_for_floating_geometry(
+        applied, time.monotonic() + _GEOMETRY_SETTLE_TIMEOUT
+    )
+    if not readable:
+        ctx.add_failure(
+            "floating geometry could not be verified: live tree unavailable"
+        )
+        return
+    ctx.placements = after_placements
+    for node, win_id, workspace, expected in applied:
+        live = after_rects.get(win_id)
+        actual_workspace = after_placements.get(win_id)
+        if win_id not in after_placements:
+            _record_missing(ctx, node)
+            continue
+        if after_types.get(win_id) != "floating_con":
+            ctx.add_failure(f"{_failure_label(node)}: window is not floating")
+        if live is None:
+            ctx.add_failure(
+                f"{_failure_label(node)}: geometry is unavailable, expected {expected}"
+            )
+        elif not _rect_matches(live, expected):
+            ctx.add_failure(
+                f"{_failure_label(node)}: geometry is {live}, expected {expected}"
+            )
+        if actual_workspace != workspace:
+            ctx.add_failure(
+                f"{_failure_label(node)}: workspace is {actual_workspace!r}, "
+                f"expected {workspace!r}"
+            )
 
 
 def _apply_marks(win_id: int, marks: list[str]) -> None:
@@ -498,9 +1695,17 @@ def _apply_marks(win_id: int, marks: list[str]) -> None:
 
 
 def _apply_fullscreen(win_id: int, fullscreen_mode: int) -> None:
-    """Apply saved fullscreen state to a window."""
-    if fullscreen_mode == 1:
-        cmd(f"[con_id={win_id}] fullscreen")
+    """Apply saved fullscreen state to a window.
+
+    Use the explicit enable/disable forms: the bare command toggles, so a
+    rerun over an already-fullscreen window would leave it in the wrong state.
+    """
+    if fullscreen_mode == 2:
+        cmd(f"[con_id={win_id}] fullscreen enable global")
+    elif fullscreen_mode == 1:
+        cmd(f"[con_id={win_id}] fullscreen enable")
+    else:
+        cmd(f"[con_id={win_id}] fullscreen disable")
 
 
 def _apply_border(win_id: int, border: str) -> None:
@@ -511,9 +1716,9 @@ def _apply_border(win_id: int, border: str) -> None:
 
 def _apply_percent(win_id: int, percent: float | None, parent_layout: str) -> None:
     """Restore a window's share of its parent split."""
-    if percent is None or isinstance(percent, bool):
-        return
-    if not isinstance(percent, (int, float)) or not math.isfinite(percent):
+    # `Snapshot` already dropped a non-finite or boolean share, so the only
+    # value left to refuse is a missing one.
+    if percent is None:
         return
     # Skip shares near 0 or 1, including single-window splits. There is
     # nothing to resize, and sway returns a parse error for those values.
@@ -555,18 +1760,26 @@ def _apply_layout(layout: str) -> None:
 
 
 def _resolve_window(node: dict, ctx: RestoreContext) -> int | None:
-    """Launch or locate the window for a saved node."""
-    if node_app_id(node) == "helium":
+    """Return the live window id for a saved node.
+
+    The normal path reads the id that materialization already resolved. A
+    node that bypassed materialization, such as a hidden scratchpad window
+    launched just before it is parked, falls back to launching on demand. A
+    grouped app asks its group restore for the id instead.
+    """
+    if ctx.registry.has(node):
+        return ctx.registry.resolve(node)
+    if handler_for(canonical_app_id(node_app_id(node))).grouped:
         return get_helium_restored_id(node, ctx)
     return launch_and_get_id(node, ctx.claimed_ids)
 
 
 def _record_missing(ctx: RestoreContext, node: dict) -> None:
     """Record a saved window that did not come back."""
-    if node_app_id(node) == "kitty_drop":
-        # The dropdown terminal is spawned by its own keybinding on demand.
+    if handler_for(canonical_app_id(node_app_id(node))).on_demand:
+        # A window spawned by its own keybinding is not lost.
         return
-    ctx.missing.append(_failure_label(node))
+    ctx.add_missing(_failure_label(node))
 
 
 def _restore_floating(node: dict, ctx: RestoreContext) -> None:
@@ -580,6 +1793,7 @@ def _restore_floating(node: dict, ctx: RestoreContext) -> None:
         return
 
     _apply_marks(win_id, node.get("marks", []))
+    _ensure_on_workspace(win_id, ctx.current_workspace, ctx)
 
     rect = node.get("rect", {})
     fullscreen_mode = node.get("fullscreen_mode", 0)
@@ -599,9 +1813,9 @@ def _restore_floating(node: dict, ctx: RestoreContext) -> None:
         _apply_fullscreen(win_id, fullscreen_mode)
         return
 
-    if app_id == "helium" and ctx.current_workspace:
-        cmd(_move_to_workspace_cmd(win_id, ctx.current_workspace))
     cmd(f"[con_id={win_id}] floating enable")
+    # A plain floating window keeps exactly the border it was saved with;
+    # an empty one is left to the compositor default.
     _apply_border(win_id, node.get("border", ""))
 
     _apply_geometry(win_id, rect, ctx.current_workspace)
@@ -609,8 +1823,15 @@ def _restore_floating(node: dict, ctx: RestoreContext) -> None:
 
 
 def _restore_hidden_scratchpad(node: dict, ctx: RestoreContext) -> None:
-    """Restore one hidden scratchpad window and park it out of sight."""
+    """Restore hidden scratchpad windows and park them out of sight.
+
+    A scratchpad group is saved as a container. Its windows are flattened
+    into the scratchpad so the group's layout is lost but none of its
+    windows are dropped.
+    """
     if node.get("type") != "window":
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            _restore_hidden_scratchpad(child, ctx)
         return
     app_id = node_app_id(node)
     win_id = _resolve_window(node, ctx)
@@ -618,19 +1839,15 @@ def _restore_hidden_scratchpad(node: dict, ctx: RestoreContext) -> None:
         _record_missing(ctx, node)
         return
 
+    _apply_marks(win_id, node.get("marks", []))
+
     if app_id == "kitty_drop":
         # Dropdown is always scratchpad; restore its mark and border so the
         # keybind can find it again, then park it out of sight.
-        _apply_marks(win_id, node.get("marks", []))
-        _apply_border(win_id, node.get("border", "normal"))
-        cmd(f"[con_id={win_id}] move scratchpad")
+        _apply_border(win_id, node.get("border") or "normal")
+        _park_in_scratchpad(win_id, node, ctx)
         return
 
-    _apply_marks(win_id, node.get("marks", []))
-    cmd(f"[con_id={win_id}] floating enable")
-    # Older state files predate the saved border, so fall back to the
-    # chromed style those windows were restored with.
-    _apply_border(win_id, node.get("border") or "normal")
     # Geometry is applied on the current staging workspace, whose origin
     # matches a normal workspace on the same output. i3 refuses to switch to
     # SCRATCH_RESTORE_WORKSPACE because it is an internal name, so on i3 the
@@ -638,8 +1855,13 @@ def _restore_hidden_scratchpad(node: dict, ctx: RestoreContext) -> None:
     staging = (
         SCRATCH_RESTORE_WORKSPACE if detect_backend() != "i3" else ctx.current_workspace
     )
+    _ensure_on_workspace(win_id, staging, ctx)
+    cmd(f"[con_id={win_id}] floating enable")
+    # Every scratchpad path falls back to the chromed style an older state
+    # file was restored with when it carries no border of its own.
+    _apply_border(win_id, node.get("border") or "normal")
     _apply_geometry(win_id, node.get("rect", {}), staging)
-    cmd(f"[con_id={win_id}] move scratchpad")
+    _park_in_scratchpad(win_id, node, ctx)
 
 
 def _failure_label(node: dict) -> str:
@@ -647,24 +1869,12 @@ def _failure_label(node: dict) -> str:
     return str(node.get("name") or node_app_id(node) or node.get("type", "window"))
 
 
-def _contains_helium(node: dict) -> bool:
-    """Report whether a saved subtree holds a Helium window."""
-    if node.get("type") == "window" and node_app_id(node) == "helium":
-        return True
-    return any(
-        _contains_helium(child)
-        for child in node.get("nodes", []) + node.get("floating_nodes", [])
-    )
-
-
 def _record_failure(ctx: RestoreContext, node: dict, exc: Exception) -> None:
     """Record a failed window so the rest of the session still restores."""
-    ctx.failures.append(f"{_failure_label(node)}: {exc}")
+    ctx.add_failure(f"{_failure_label(node)}: {exc}")
 
 
-def _restore_child(
-    node: dict, ctx: RestoreContext, parent_layout: str | None = None
-) -> None:
+def _restore_child(node: dict, ctx: RestoreContext, parent_layout: str | None) -> None:
     """Restore one tiled child, keeping a failure local to that child."""
     try:
         _restore_node(node, ctx, parent_layout=parent_layout)
@@ -691,15 +1901,15 @@ def _restore_node(
     if ntype == "workspace":
         ctx.current_workspace = node["name"]
         cmd(_workspace_cmd(node["name"]))
-        # Focus parent so `layout` targets the workspace even if a floating
-        # window is focused; silent variant avoids noise when already focused.
-        run_command("focus parent")
+        _focus_workspace_root(node["name"], _read_tree(ctx))
         _apply_layout(node["layout"])
         for child in node.get("nodes", []):
             cmd(_workspace_cmd(node["name"]))
+            _focus_workspace_root(node["name"], _read_tree(ctx))
             _restore_child(child, ctx, parent_layout=node["layout"])
         for child in node.get("floating_nodes", []):
             cmd(_workspace_cmd(node["name"]))
+            _focus_workspace_root(node["name"], _read_tree(ctx))
             _restore_floating_child(child, ctx)
 
     elif ntype == "con":
@@ -715,14 +1925,12 @@ def _restore_node(
             _restore_floating_child(child, ctx)
 
     elif ntype == "window":
-        app_id = node_app_id(node)
         win_id = _resolve_window(node, ctx)
         if not win_id:
             _record_missing(ctx, node)
             return
         _apply_marks(win_id, node.get("marks", []))
-        if app_id == "helium" and ctx.current_workspace:
-            cmd(_move_to_workspace_cmd(win_id, ctx.current_workspace))
+        _ensure_on_workspace(win_id, ctx.current_workspace, ctx)
         cmd(f"[con_id={win_id}] focus")
         _apply_fullscreen(win_id, node.get("fullscreen_mode", 0))
         _apply_percent(win_id, node.get("percent"), parent_layout or "")
@@ -768,21 +1976,45 @@ def restore_session(
         )
 
 
-def diff_sessions() -> None:
-    """Show a plain-English diff of the live and saved sessions."""
+def _count_windows(node: dict) -> int:
+    """Count the windows under a live or saved node."""
+    if node.get("type") == "window":
+        return 1
+    if node.get("type") in ("con", "floating_con") and node_app_id(node):
+        return 1
+    total = 0
+    for child in node.get("nodes", []):
+        total += _count_windows(child)
+    for child in node.get("floating_nodes", []):
+        total += _count_windows(child)
+    return total
+
+
+def diff_sessions() -> bool:
+    """Show a plain-English diff of the live and saved sessions.
+
+    Returns:
+        True when the diff was printed, False when the saved session or the
+        live tree could not be read.
+    """
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             payload = json.load(f)
         saved_ws, saved_hidden, saved_bg, _ = _normalise_restore_payload(payload)
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         print(f"Saved session unreadable: {exc}")
-        return
+        return False
 
     try:
         live_tree = get_tree()
     except OSError as exc:
         print(f"Cannot read live tree: {exc}")
-        return
+        return False
     finally:
         try:
             close_connection()
@@ -797,24 +2029,10 @@ def diff_sessions() -> None:
         if not isinstance(name, str):
             continue
         count = 0
-
-        def cnt_live(node: dict) -> int:
-            """Count live windows under a node."""
-            if node.get("type") == "window":
-                return 1
-            if node.get("type") in ("con", "floating_con") and node_app_id(node):
-                return 1
-            s = 0
-            for c in node.get("nodes", []):
-                s += cnt_live(c)
-            for c in node.get("floating_nodes", []):
-                s += cnt_live(c)
-            return s
-
         for n in ws.get("nodes", []):
-            count += cnt_live(n)
+            count += _count_windows(n)
         for n in ws.get("floating_nodes", []):
-            count += cnt_live(n)
+            count += _count_windows(n)
         live_ws[name] = count
 
     saved_ws_map: dict[str, dict] = {
@@ -826,23 +2044,9 @@ def diff_sessions() -> None:
         live_c = live_ws.get(name)
         saved = saved_ws_map.get(name)
         if saved:
-            # Count saved windows with the same predicate as the live count in
-            # the preceding block.
-            def scnt(node: dict) -> int:
-                """Count saved windows under a node."""
-                if node.get("type") == "window":
-                    return 1
-                if node.get("type") in ("con", "floating_con") and node_app_id(node):
-                    return 1
-                s = 0
-                for c in node.get("nodes", []):
-                    s += scnt(c)
-                for c in node.get("floating_nodes", []):
-                    s += scnt(c)
-                return s
-
-            saved_c = sum(scnt(n) for n in saved.get("nodes", [])) + sum(
-                scnt(n) for n in saved.get("floating_nodes", [])
+            # Both sides count with the same predicate: `_count_windows`.
+            saved_c = sum(_count_windows(n) for n in saved.get("nodes", [])) + sum(
+                _count_windows(n) for n in saved.get("floating_nodes", [])
             )
         else:
             saved_c = None
@@ -862,6 +2066,7 @@ def diff_sessions() -> None:
 
     if not saved_ws and not saved_hidden:
         print("  Saved session is empty")
+    return True
 
 
 def _restore_session_locked(
@@ -896,7 +2101,13 @@ def _restore_session_locked(
                 )
                 return
             hidden_scratchpad = []
-            background_apps = None
+            # A filtered restore covers one workspace only. The background
+            # apps belong to the whole session, so they are left alone:
+            # an empty list keeps the sidecar fallback from launching them.
+            background_apps = []
+            # The saved focus may name a workspace outside the filter, so
+            # the restore finishes on the workspace it actually restored.
+            focused_workspace = workspace_filter
             log.info(
                 "Restoring only workspace %s (%d/%d)",
                 workspace_filter,
@@ -908,13 +2119,23 @@ def _restore_session_locked(
                 urgency="critical",
                 timeout_ms=0,
             )
-    except (OSError, json.JSONDecodeError, StateValidationError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        StateValidationError,
+    ) as exc:
         _notify("session restore skipped: invalid session file", urgency="normal")
         log.warning("Invalid session file %s: %s", STATE_FILE, exc)
         return
 
     ctx = RestoreContext()
-    partial_failures: list[str] = []
+    # A filtered restore covers one workspace, so the browser must not
+    # replay its whole session: that would reopen the windows saved on
+    # every other workspace.
+    ctx.helium_restore_last_session = workspace_filter is None
+    destination = focused_workspace or "1"
+    destination_ready = False
 
     try:
         _notify(
@@ -929,22 +2150,37 @@ def _restore_session_locked(
         for node in hidden_scratchpad:
             collect_helium_nodes(node, ctx)
 
-        # Browser startup overlaps the workspace walk. Helium workspaces go
-        # last so a slow browser cannot hold up the rest of the session.
-        # Window order inside each workspace stays the same.
-        start_helium_restore(ctx)
-        workspaces = sorted(workspaces, key=_contains_helium)
+        def _arrange(group: list[dict]) -> None:
+            """Place a group of workspaces, keeping failures local."""
+            for ws in group:
+                try:
+                    _restore_node(ws, ctx)
+                except Exception as exc:
+                    ctx.add_failure(f"{ws.get('name', '?')}: {exc}")
+                    log.exception(
+                        "Partial restore failure in workspace %s", ws.get("name")
+                    )
 
-        for ws in workspaces:
-            try:
-                _restore_node(ws, ctx)
-            except Exception as exc:
-                partial_failures.append(f"{ws.get('name', '?')}: {exc}")
-                log.exception("Partial restore failure in workspace %s", ws.get("name"))
+        # Launch every visible window before placing any of them. A window
+        # that maps mid-walk can steal focus and split the wrong container.
+        # They map on a staging workspace so placement can move each one into
+        # its saved container; a window already on its target workspace would
+        # be left where it is and the nesting would not be rebuilt.
+        visible_windows = [win for ws in workspaces for win in _iter_windows(ws)]
+        hidden_windows = [
+            win for node in hidden_scratchpad for win in _iter_windows(node)
+        ]
+        # A restore that was interrupted leaves some of its windows live. A
+        # rerun reuses those instead of launching a second copy of the app,
+        # so the session converges instead of doubling.
+        _adopt_live_windows(visible_windows + hidden_windows, ctx)
+        if visible_windows:
+            cmd(_workspace_cmd(RESTORE_STAGING_WORKSPACE))
+        _materialize(visible_windows, ctx)
 
-        # Windows that failed on their own are collected here, so the
-        # summary can report them without aborting the session.
-        partial_failures.extend(ctx.failures)
+        # Every window exists by now, so the workspaces are arranged in the
+        # order they were saved; no workspace has to wait for the browser.
+        _arrange(workspaces)
 
         if hidden_scratchpad and detect_backend() != "i3":
             # Stage geometry on a scratch workspace before parking the windows
@@ -952,39 +2188,81 @@ def _restore_session_locked(
             # so it stays on the restored workspace instead.
             cmd(_workspace_cmd(SCRATCH_RESTORE_WORKSPACE))
         if hidden_scratchpad:
+            # Hidden windows are launched just before they are parked, so they
+            # are not left visible on a normal workspace while the rest of the
+            # session is arranged.
             for node in hidden_scratchpad:
                 try:
                     _restore_hidden_scratchpad(node, ctx)
                 except Exception as exc:
-                    partial_failures.append(f"hidden scratchpad: {exc}")
+                    ctx.add_failure(f"hidden scratchpad {_failure_label(node)}: {exc}")
                     log.exception("Failed to restore hidden scratchpad window")
 
-        cmd(_workspace_cmd(focused_workspace) if focused_workspace else "workspace 1")
+        # Reconcile after every workspace is arranged. Windows can drift
+        # after the walk places them, and an interrupted restore leaves some
+        # of them elsewhere; this pass moves them back by con id and verifies
+        # the result before the session is reported as restored.
+        #
+        # The reconciliation runs before the recovery. A window whose
+        # container died is bound to the replacement first. Thus the sweep
+        # does not report it as a window that matches no saved window.
+        _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+        _recover_late_windows(workspaces, hidden_scratchpad, ctx)
+
+        # An application asks for its own size right after it maps, and that
+        # request can land after the walk placed the window. The floating
+        # geometry is therefore checked against the live tree and applied
+        # again when the window no longer matches it. This runs while staging
+        # is focused so a window that maps during the settle pass can still
+        # be recovered.
+        _verify_floating_geometry(workspaces, ctx)
+
+        # Leave the staging workspaces only after they are empty. The final
+        # sweep and reconciliation happen before the destination is focused,
+        # so windows that mapped during the geometry pass are recovered and
+        # windows that disappeared are reported as missing.
+        destination_ready = _finish_staging(
+            workspaces,
+            hidden_scratchpad,
+            ctx,
+            destination,
+        )
 
     except Exception:
         _notify("session restore failed")
         log.exception("Session restore failed.")
         raise
     finally:
-        if ctx.helium_thread is not None and ctx.helium_thread.is_alive():
-            ctx.helium_thread.join(timeout=1.0)
+        # The summary is collected before this block, so a focus problem
+        # here can no longer reach this run's report: it is logged instead.
+        if not destination_ready:
+            try:
+                if not cmd(_workspace_cmd(destination)):
+                    log.warning(
+                        "Could not restore destination workspace %s", destination
+                    )
+            except Exception:
+                log.exception("Could not restore destination workspace %s", destination)
+        ctx.registry.close()
         close_connection()
 
     message = "<b>session restored successfully.</b>"
-    if partial_failures:
-        _notify(
-            f"{message} Partial failures: {len(partial_failures)}. See logs.",
-            urgency="normal",
-        )
-        log.warning("Partial restore failures: %s", ", ".join(partial_failures))
-    elif ctx.missing:
-        _notify(
-            f"{message} {len(ctx.missing)} window(s) did not come back. See logs.",
-            urgency="normal",
-        )
-        log.warning("Windows not restored: %s", ", ".join(ctx.missing))
+    if ctx.failures or ctx.missing:
+        # Both kinds of loss are reported: a partial failure says a window
+        # came back in the wrong state, a missing one says it never came
+        # back at all. Hiding either hides the reason the session is short.
+        summary = []
+        if ctx.failures:
+            summary.append(f"Partial failures: {len(ctx.failures)}")
+        if ctx.missing:
+            summary.append(f"{len(ctx.missing)} window(s) did not come back")
+        _notify(f"{message} {'; '.join(summary)}. See logs.", urgency="normal")
     else:
         _notify(f"{message} you can safely move now.")
+    if ctx.failures:
+        log.warning("Partial restore failures: %s", ", ".join(ctx.failures))
+    if ctx.missing:
+        log.warning("Windows not restored: %s", ", ".join(ctx.missing))
     log.info("Restore complete.")
 
     # Daemon checks and background launches are best effort. Running them

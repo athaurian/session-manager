@@ -14,13 +14,12 @@ class FakeWatcher:
     """Context manager that stands in for ``WindowEventWatcher``."""
 
     def __init__(self, *_args, **_kwargs):
-        self.closed = False
+        pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_exc):
-        self.closed = True
         return False
 
 
@@ -115,8 +114,6 @@ class RestoreHarnessTestCase(unittest.TestCase):
         self._patches = [
             unittest.mock.patch.object(restore_mod, "cmd", self._record_cmd),
             unittest.mock.patch.object(restore_mod, "run_command", self._record_cmd),
-            # The geometry settle delay would otherwise slow every test down.
-            unittest.mock.patch.object(restore_mod, "sleep", lambda _seconds: None),
             unittest.mock.patch.object(restore_mod, "get_tree", self._fake_get_tree),
             unittest.mock.patch.object(
                 restore_mod, "launch_and_get_id", self._fake_launch

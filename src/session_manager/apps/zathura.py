@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import (
@@ -12,12 +13,18 @@ from ..config import (
     ZATHURA_GOTO_PAGE_DEADLINE,
 )
 from ..ipc import WindowEventWatcher
+from ..proc_cache import ProcCache
 from ._common import read_cmdline, reap_if_needed
+
+
+def _dbus_name(pid: int) -> str:
+    """Return the D-Bus name a zathura instance registers for its pid."""
+    return f"org.pwmt.zathura.PID-{pid}"
 
 
 def get_zathura_info(pid: int) -> tuple[str, int]:
     """Return the document path and page number for a zathura window."""
-    bus_name = f"org.pwmt.zathura.PID-{pid}"
+    bus_name = _dbus_name(pid)
     doc_path, page_num = "", 0
     try:
         r = subprocess.run(
@@ -69,7 +76,13 @@ def get_zathura_info(pid: int) -> tuple[str, int]:
     return "", 0
 
 
-def launch_zathura(node: dict, claimed_ids: set[int]) -> int | None:
+def capture_zathura(_source: dict, pid: int, _cache: ProcCache) -> dict[str, object]:
+    """Return the saved document and page for a zathura window."""
+    doc, page = get_zathura_info(pid)
+    return {"document_path": doc, "page_number": page}
+
+
+def launch_zathura(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch zathura and return its window id."""
     from .generic import wait_for_window_by_pid
 
@@ -109,7 +122,7 @@ def launch_zathura(node: dict, claimed_ids: set[int]) -> int | None:
     if page_num and document:
         # D-Bus name is only registered after the document loads. Poll the
         # bus instead of sleeping blindly.
-        bus_name = f"org.pwmt.zathura.PID-{proc.pid}"
+        bus_name = _dbus_name(proc.pid)
         deadline = time.monotonic() + ZATHURA_GOTO_PAGE_DEADLINE
         while time.monotonic() < deadline:
             r = subprocess.run(

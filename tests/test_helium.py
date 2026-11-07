@@ -2,7 +2,6 @@
 event-driven title assignment loop.
 """
 
-import time
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -31,22 +30,17 @@ class ScriptedWatcher:
 
     def __init__(self, events):
         self.events = list(events)
-        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self.close()
         return False
 
     def get(self, timeout):
         if self.events:
             return self.events.pop(0)
         return None
-
-    def close(self):
-        self.closed = True
 
 
 def ev(change, cid, app_id="helium", name=""):
@@ -99,7 +93,7 @@ class HeliumTestCase(unittest.TestCase):
             ctx.helium_saved_nodes.append(node)
             ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
             ctx.helium_restored_ids.append(None)
-        return ctx, helium_mod._restore_helium_group(ctx)
+        return ctx, helium_mod.restore_helium_group(ctx)
 
 
 class TestHeliumGuard(HeliumTestCase):
@@ -111,7 +105,7 @@ class TestHeliumGuard(HeliumTestCase):
 
     def test_sets_started_without_saved_nodes(self):
         ctx = RestoreContext()
-        helium_mod._restore_helium_group(ctx)
+        helium_mod.restore_helium_group(ctx)
         self.assertTrue(ctx.helium_restore_started)
         self.assertEqual(len(FakePopen.instances), 0)
 
@@ -119,7 +113,7 @@ class TestHeliumGuard(HeliumTestCase):
         self.watcher_events = [ev("new", 72, name="tab a")]
         ctx, _ = self.run_group([make_window("helium", name="tab a")])
         launches = len(FakePopen.instances)
-        helium_mod._restore_helium_group(ctx)
+        helium_mod.restore_helium_group(ctx)
         self.assertEqual(len(FakePopen.instances), launches)
 
 
@@ -161,12 +155,23 @@ class TestHeliumAssignment(HeliumTestCase):
 
     def test_tree_scan_fallback_matches_titles(self):
         """If title events are missed, the periodic tree scan still assigns."""
-        saved = [make_window("helium", name="Only Tab")]
-        self.watcher_events = [ev("new", 31, name="")]
-        self._populate_on_launch([helium_node(31, "Only Tab")])
+        saved = [
+            make_window("helium", name="Tab A"),
+            make_window("helium", name="Tab B"),
+        ]
+        # Only the first window reports a title event; the second is never
+        # announced, so its title comes from the periodic tree scan.
+        self.watcher_events = [ev("new", 11, name="Tab A")]
+        # The live tree lists both windows in the opposite order, so a
+        # positional assignment would swap them.
+        self._populate_on_launch([helium_node(12, "Tab B"), helium_node(11, "Tab A")])
 
-        ctx, _ = self.run_group(saved)
-        self.assertEqual(ctx.helium_restored_ids, [31])
+        profile = helium_mod.APP_PROFILES["helium"]
+        # The scan fires 0.25 s after the launch; a deadline just past it
+        # lets the scan run while the test stays fast.
+        with unittest.mock.patch.dict(profile, {"timeout": 0.3}):
+            ctx, _ = self.run_group(saved)
+        self.assertEqual(ctx.helium_restored_ids, [11, 12])
 
     def test_close_event_drops_unassigned_window(self):
         saved = [make_window("helium", name="Tab A")]
@@ -210,7 +215,7 @@ class TestHeliumEarlyReuse(HeliumTestCase):
                 ctx.helium_saved_nodes.append(node)
                 ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
                 ctx.helium_restored_ids.append(None)
-            helium_mod._restore_helium_group(ctx)
+            helium_mod.restore_helium_group(ctx)
 
         self.assertEqual(len(FakePopen.instances), 0)
         self.assertEqual(sorted(ctx.helium_restored_ids), [91, 92])
@@ -229,40 +234,48 @@ class TestHeliumEarlyReuse(HeliumTestCase):
             ctx.helium_saved_nodes.append(saved[0])
             ctx.helium_saved_index[id(saved[0])] = 0
             ctx.helium_restored_ids.append(None)
-            helium_mod._restore_helium_group(ctx)
+            helium_mod.restore_helium_group(ctx)
 
         self.assertEqual(ctx.helium_restored_ids, [93])
 
 
-class TestHeliumBackgroundStart(HeliumTestCase):
-    def _ctx(self, node):
+class TestHeliumScopedRestore(HeliumTestCase):
+    """A scoped restore opens one window per saved window, not the session."""
+
+    def _run_scoped(self, saved_nodes):
         ctx = RestoreContext()
-        ctx.helium_saved_nodes.append(node)
-        ctx.helium_saved_index[id(node)] = 0
-        ctx.helium_restored_ids.append(None)
+        ctx.helium_restore_last_session = False
+        for node in saved_nodes:
+            ctx.helium_saved_nodes.append(node)
+            ctx.helium_saved_index[id(node)] = len(ctx.helium_saved_index)
+            ctx.helium_restored_ids.append(None)
+        helium_mod.restore_helium_group(ctx)
         return ctx
 
-    def test_start_without_saved_nodes_does_nothing(self):
-        ctx = RestoreContext()
-        helium_mod.start_helium_restore(ctx)
-        self.assertIsNone(ctx.helium_thread)
+    def test_does_not_replay_the_browser_session(self):
+        FakePopen.on_launch = lambda: self.tree_windows.append(helium_node(81, ""))
+        self.watcher_events = [ev("new", 81, name="")]
+        self._run_scoped([make_window("helium", name="Tab A")])
+        commands = [inst.args[0] for inst in FakePopen.instances]
+        self.assertEqual(commands, [["helium-browser", "--new-window", "about:blank"]])
 
-    def test_get_restored_id_joins_the_background_thread(self):
-        node = make_window("helium", name="tab a")
-        ctx = self._ctx(node)
+    def test_opens_one_window_per_saved_window(self):
+        windows = [helium_node(82, ""), helium_node(83, "")]
+        FakePopen.on_launch = lambda: self.tree_windows.append(windows.pop(0))
+        self.watcher_events = [ev("new", 82, name=""), ev("new", 83, name="")]
+        saved = [
+            make_window("helium", name="Tab A"),
+            make_window("helium", name="Tab B"),
+        ]
+        ctx = self._run_scoped(saved)
+        self.assertEqual(len(FakePopen.instances), 2)
+        self.assertEqual(ctx.helium_restored_ids, [82, 83])
 
-        def slow_group(context):
-            time.sleep(0.05)
-            context.helium_restore_started = True
-            context.helium_restored_ids[0] = 99
-
-        with unittest.mock.patch.object(
-            helium_mod, "_restore_helium_group", slow_group
-        ):
-            helium_mod.start_helium_restore(ctx)
-            self.assertIsNotNone(ctx.helium_thread)
-            self.assertEqual(helium_mod.get_helium_restored_id(node, ctx), 99)
-            self.assertFalse(ctx.helium_thread.is_alive())
+    def test_reuses_a_live_window_with_a_matching_title(self):
+        self.tree_windows = [helium_node(84, "Tab A")]
+        ctx = self._run_scoped([make_window("helium", name="Tab A")])
+        self.assertEqual(ctx.helium_restored_ids, [84])
+        self.assertEqual(len(FakePopen.instances), 0)
 
 
 class TestHeliumResolve(HeliumTestCase):

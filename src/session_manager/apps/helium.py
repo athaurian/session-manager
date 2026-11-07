@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import threading
 import time
+from collections.abc import Collection
+from itertools import islice
 
 from ..config import (
     APP_PROFILES,
@@ -16,6 +17,7 @@ from ..config import (
     HELIUM_TITLE_GRACE_PERIOD,
     HELIUM_WINDOW_STALL_TIMEOUT,
     WINDOW_SETTLE_POLL_INTERVAL,
+    AppProfile,
 )
 from ..ipc import WindowEventWatcher, get_tree, node_app_id, walk_tree
 from ..proc_cache import ProcCache
@@ -76,15 +78,31 @@ def _assign_by_title(
     return matched_any
 
 
-def _matching_helium_ids() -> list[int]:
-    """Return the ids of live Helium windows."""
-    return [
-        n["id"]
-        for n in walk_tree(get_tree())
-        if n.get("type") in ("con", "floating_con")
-        and node_app_id(n) == "helium"
-        and n.get("id") is not None
-    ]
+def _live_helium_titles(
+    only: Collection[int] | None = None,
+    skip: Collection[int] = (),
+) -> dict[int, str]:
+    """Return the titles of live Helium windows, by window id.
+
+    `only` restricts the result to those ids and `skip` excludes them, so
+    the baseline, the new-window, and the unassigned views of the same walk
+    are all one filter over one tree read.
+    """
+    result: dict[int, str] = {}
+    for n in walk_tree(get_tree()):
+        cid = n.get("id")
+        if (
+            cid is None
+            or n.get("type") not in ("con", "floating_con")
+            or node_app_id(n) != "helium"
+        ):
+            continue
+        if only is not None and cid not in only:
+            continue
+        if cid in skip:
+            continue
+        result[cid] = n.get("name") or ""
+    return result
 
 
 def collect_helium_nodes(node: dict, ctx: RestoreContext) -> None:
@@ -98,9 +116,8 @@ def collect_helium_nodes(node: dict, ctx: RestoreContext) -> None:
         collect_helium_nodes(child, ctx)
 
 
-def _suppress_helium_crash_prompt(cache: ProcCache | None = None) -> None:
+def _suppress_helium_crash_prompt(cache: ProcCache) -> None:
     """Clear Helium's crash markers before launch."""
-    cache = cache or ProcCache.snapshot()
     if cache.process_named_running("helium"):
         log.info("Helium already running; skipping crash-marker patch.")
         return
@@ -135,20 +152,101 @@ def _suppress_helium_crash_prompt(cache: ProcCache | None = None) -> None:
 
 def _live_new_helium_windows(baseline_ids: set[int]) -> dict[int, str]:
     """Return live Helium windows that appeared after the baseline."""
-    result: dict[int, str] = {}
-    for n in walk_tree(get_tree()):
-        cid = n.get("id")
-        if (
-            cid is not None
-            and n.get("type") in ("con", "floating_con")
-            and node_app_id(n) == "helium"
-            and cid not in baseline_ids
-        ):
-            result[cid] = n.get("name") or ""
-    return result
+    return _live_helium_titles(skip=baseline_ids)
 
 
-def _restore_helium_group(ctx: RestoreContext) -> None:
+def _wait_for_new_window(
+    watcher: WindowEventWatcher,
+    baseline_ids: set[int],
+    known: set[int],
+    deadline: float,
+) -> int | None:
+    """Wait for one new browser window to appear.
+
+    The window event stream is the primary signal; the tree is scanned as
+    a fallback for an event that was missed. Returns the new window id, or
+    None when the deadline passes.
+    """
+    next_scan = time.monotonic()
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        wait = min(
+            WINDOW_SETTLE_POLL_INTERVAL,
+            max(0.01, deadline - now),
+            max(0.01, next_scan - now),
+        )
+        ev = watcher.get(timeout=wait)
+        if ev is not None:
+            cid = ev.container.get("id")
+            if (
+                ev.change == "new"
+                and cid is not None
+                and node_app_id(ev.container) == "helium"
+                and cid not in baseline_ids
+                and cid not in known
+            ):
+                return cid
+        now = time.monotonic()
+        if now >= next_scan:
+            for cid in _live_new_helium_windows(baseline_ids):
+                if cid not in known:
+                    return cid
+            next_scan = now + WINDOW_SETTLE_POLL_INTERVAL
+    return None
+
+
+def _restore_scoped_helium(
+    ctx: RestoreContext, count: int, baseline_ids: set[int], profile: AppProfile
+) -> None:
+    """Restore the browser windows of a scoped restore.
+
+    A restore that covers a single workspace cannot replay the browser's
+    own session, because that session holds the windows saved on every
+    other workspace. Each window is opened on its own instead, and the
+    browser does not expose its URLs to the compositor, so a window that
+    was not already live comes back blank.
+
+    A live window whose title matches a saved one is reused, so a browser
+    that is already running keeps its tabs instead of growing blank ones.
+    """
+    remaining_saved = list(range(count))
+    unassigned = list(baseline_ids)
+    live_titles = _live_helium_titles(only=baseline_ids)
+    # Only a title match reuses a live window here. A scoped restore must
+    # not claim a window that belongs to another workspace's browser
+    # session, so an unmatched saved window gets a blank one instead.
+    _assign_by_title(remaining_saved, unassigned, live_titles, ctx)
+
+    missing = [idx for idx in range(count) if ctx.helium_restored_ids[idx] is None]
+    if not missing:
+        return
+
+    deadline = time.monotonic() + profile["timeout"]
+    opened: set[int] = set()
+    with WindowEventWatcher() as watcher:
+        for idx in missing:
+            try:
+                proc = subprocess.Popen(
+                    ["helium-browser", "--new-window", "about:blank"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                log.warning("Could not launch helium window")
+                break
+            try:
+                win_id = _wait_for_new_window(watcher, baseline_ids, opened, deadline)
+            finally:
+                reap_if_needed(proc)
+            if win_id is None:
+                log.warning("Helium window %d did not appear", idx + 1)
+                break
+            opened.add(win_id)
+            ctx.helium_restored_ids[idx] = win_id
+
+
+def restore_helium_group(ctx: RestoreContext) -> None:
     """Restore the saved Helium window group."""
     if ctx.helium_restore_started:
         return
@@ -158,28 +256,21 @@ def _restore_helium_group(ctx: RestoreContext) -> None:
 
     count = len(ctx.helium_saved_nodes)
     profile = APP_PROFILES.get("helium", DEFAULT_APP_PROFILE)
-    baseline_ids = set(_matching_helium_ids())
-    _suppress_helium_crash_prompt()
+    baseline_ids = set(_live_helium_titles())
+    cache = ProcCache.snapshot()
+    _suppress_helium_crash_prompt(cache)
+
+    if not ctx.helium_restore_last_session:
+        _restore_scoped_helium(ctx, count, baseline_ids, profile)
+        return
 
     # If Helium is already running with enough windows, reuse them directly
     # instead of launching a new instance (which would only signal the
     # existing one and exit, but still cost time).
-    if (
-        ProcCache.snapshot().process_named_running("helium")
-        and len(baseline_ids) >= count
-    ):
-        existing_windows: dict[int, str] = {}
-        for n in walk_tree(get_tree()):
-            cid = n.get("id")
-            if (
-                cid is not None
-                and n.get("type") in ("con", "floating_con")
-                and node_app_id(n) == "helium"
-                and cid in baseline_ids
-            ):
-                existing_windows[cid] = n.get("name") or ""
-                if len(existing_windows) >= count:
-                    break
+    if cache.process_named_running("helium") and len(baseline_ids) >= count:
+        existing_windows = dict(
+            islice(_live_helium_titles(only=baseline_ids).items(), count)
+        )
         if existing_windows:
             remaining_saved = list(range(count))
             unassigned = list(existing_windows.keys())
@@ -302,19 +393,6 @@ def _restore_helium_group(ctx: RestoreContext) -> None:
         remaining_saved = list(range(count))
         unassigned = list(windows.keys())
 
-        def _live_titles_for_unassigned() -> dict[int, str]:
-            """Return current titles for live windows still unassigned."""
-            ids = set(unassigned)
-            if not ids:
-                return {}
-            return {
-                n["id"]: (n.get("name") or "")
-                for n in walk_tree(get_tree())
-                if n.get("type") in ("con", "floating_con")
-                and node_app_id(n) == "helium"
-                and n.get("id") in ids
-            }
-
         def _match_remaining(titles: dict[int, str]) -> None:
             """Assign every window that the current titles can match."""
             while _assign_by_title(remaining_saved, unassigned, titles, ctx):
@@ -347,7 +425,7 @@ def _restore_helium_group(ctx: RestoreContext) -> None:
 
             now = time.monotonic()
             if now >= next_title_scan:
-                live_titles = _live_titles_for_unassigned()
+                live_titles = _live_helium_titles(only=unassigned)
                 if live_titles:
                     windows.update(live_titles)
                     _match_remaining(dict(windows))
@@ -360,39 +438,14 @@ def _restore_helium_group(ctx: RestoreContext) -> None:
                 break
 
 
-def start_helium_restore(ctx: RestoreContext) -> None:
-    """Start the Helium group restore in the background.
-
-    The browser takes seconds to open its windows. Restoring the group
-    concurrently lets the rest of the session be placed while it loads. The
-    first Helium node joins the thread through get_helium_restored_id().
-
-    Args:
-        ctx: Restore context holding the saved Helium nodes.
-    """
-    if ctx.helium_thread is not None or ctx.helium_restore_started:
-        return
-    if not ctx.helium_saved_nodes:
-        return
-
-    def run() -> None:
-        """Restore the group and log any failures."""
-        try:
-            _restore_helium_group(ctx)
-        except Exception:
-            log.exception("Helium restore failed")
-
-    thread = threading.Thread(target=run, name="helium-restore", daemon=True)
-    ctx.helium_thread = thread
-    thread.start()
-
-
 def get_helium_restored_id(node: dict, ctx: RestoreContext) -> int | None:
-    """Return the live window id assigned to a saved Helium node."""
-    if ctx.helium_thread is not None:
-        ctx.helium_thread.join()
-    elif not ctx.helium_restore_started:
-        _restore_helium_group(ctx)
+    """Return the live window id assigned to a saved Helium node.
+
+    The group is normally restored through materialization. A node that
+    bypassed it, such as one launched on demand, restores the group here.
+    """
+    if not ctx.helium_restore_started:
+        restore_helium_group(ctx)
     idx = ctx.helium_saved_index.get(id(node))
     if idx is None:
         return None

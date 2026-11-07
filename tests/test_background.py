@@ -11,12 +11,15 @@ import session_manager.background as bg_mod
 
 
 class FakeCache:
-    def __init__(self, running: bool = False):
+    def __init__(self, running: bool = False, cmdline: str = ""):
         self.running = running
-        self.snapshot_calls = 0
+        self.cmdline = cmdline
 
     def process_named_running(self, name):
         return self.running
+
+    def cmdline_contains(self, text):
+        return text.lower() in self.cmdline.lower()
 
 
 class TestDetectBackgroundApps(unittest.TestCase):
@@ -41,6 +44,26 @@ class TestDetectBackgroundApps(unittest.TestCase):
             result = bg_mod.detect_background_apps(FakeCache(running=False), tree={})
         self.assertEqual(result, [])
 
+    def test_exec_launcher_detected(self):
+        """The installed launcher execs `electron44`, not `vesktop`."""
+        cache = FakeCache(
+            running=False, cmdline="/usr/bin/electron44 /usr/lib/vesktop/app.asar"
+        )
+        with unittest.mock.patch.object(
+            bg_mod, "matching_window_ids_in_tree", return_value=[]
+        ):
+            result = bg_mod.detect_background_apps(cache, tree={})
+        self.assertEqual(result, [{"app_id": "vesktop"}])
+
+    def test_unrelated_command_line_not_detected(self):
+        """A bare mention of the name is not the app's own path."""
+        cache = FakeCache(running=False, cmdline="/usr/bin/grep vesktop")
+        with unittest.mock.patch.object(
+            bg_mod, "matching_window_ids_in_tree", return_value=[]
+        ):
+            result = bg_mod.detect_background_apps(cache, tree={})
+        self.assertEqual(result, [])
+
 
 class TestRestoreBackgroundApps(unittest.TestCase):
     def setUp(self):
@@ -54,6 +77,9 @@ class TestRestoreBackgroundApps(unittest.TestCase):
             unittest.mock.patch.object(bg_mod, "_ensure_background_daemons"),
             unittest.mock.patch.object(bg_mod, "matching_window_ids", return_value=[]),
             unittest.mock.patch.object(bg_mod.subprocess, "Popen", fake_popen),
+            # The launcher notifies when it starts Vesktop; a test must not
+            # send a real desktop notification.
+            unittest.mock.patch("session_manager.logging_setup.notify"),
         ]
         for p in self.patches:
             p.start()
@@ -73,6 +99,14 @@ class TestRestoreBackgroundApps(unittest.TestCase):
         bg_mod.restore_background_apps(
             [{"app_id": "vesktop"}], cache=FakeCache(running=True)
         )
+        self.assertEqual(self.popen_calls, [])
+
+    def test_skips_when_the_launcher_process_is_running(self):
+        """The launcher execs `electron44`, so only the command line says so."""
+        cache = FakeCache(
+            running=False, cmdline="/usr/bin/electron44 /usr/lib/vesktop/app.asar"
+        )
+        bg_mod.restore_background_apps([{"app_id": "vesktop"}], cache=cache)
         self.assertEqual(self.popen_calls, [])
 
     def test_skips_non_vesktop(self):
@@ -102,6 +136,14 @@ class TestRestoreBackgroundApps(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sidecar = Path(tmp) / "background.json"
             sidecar.write_text("{not json", encoding="utf-8")
+            with unittest.mock.patch.object(bg_mod, "BACKGROUND_APPS_FILE", sidecar):
+                bg_mod.restore_background_apps(None, cache=FakeCache())
+        self.assertEqual(self.popen_calls, [])
+
+    def test_non_utf8_sidecar_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "background.json"
+            sidecar.write_bytes(b"\xff")
             with unittest.mock.patch.object(bg_mod, "BACKGROUND_APPS_FILE", sidecar):
                 bg_mod.restore_background_apps(None, cache=FakeCache())
         self.assertEqual(self.popen_calls, [])
@@ -143,12 +185,15 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop("SWAY_SESSION_SKIP_DAEMON_CHECKS", None)
 
-    def _run_checks(self, results=None, backend="sway"):
+    def _run_checks(self, results=None, backend="sway", load_state="loaded"):
         results = results or {}
         calls = []
 
         def fake_run(command, **_kwargs):
-            calls.append(list(command))
+            command = list(command)
+            calls.append(command)
+            if "show" in command and "LoadState" in command:
+                return unittest.mock.Mock(returncode=0, stdout=f"{load_state}\n")
             return unittest.mock.Mock(returncode=results.get(" ".join(command), 0))
 
         with (
@@ -171,6 +216,17 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
         calls, notify = self._run_checks({"pgrep -x swayidle": 1})
         self.assertIn(["systemctl", "--user", "start", "--no-block", "swayidle"], calls)
         notify.assert_called_once()
+
+    def test_a_daemon_the_system_does_not_ship_is_skipped(self):
+        """A missing pipewire on a system without it is not a problem."""
+        calls, notify = self._run_checks(
+            {"pgrep -x pipewire": 1, "pgrep -x pipewire-pulse": 1},
+            load_state="not-found",
+        )
+        self.assertNotIn(
+            ["systemctl", "--user", "start", "--no-block", "pipewire"], calls
+        )
+        notify.assert_not_called()
 
     def test_reports_but_does_not_restart_a_missing_xss_lock(self):
         calls, notify = self._run_checks({"pgrep -x xss-lock": 1}, backend="i3")
@@ -195,14 +251,6 @@ class TestEnsureBackgroundDaemons(unittest.TestCase):
             unittest.mock.patch.dict(
                 os.environ, {"SWAY_SESSION_SKIP_DAEMON_CHECKS": "1"}
             ),
-            unittest.mock.patch.object(bg_mod.subprocess, "run") as run,
-        ):
-            bg_mod._ensure_background_daemons()
-        run.assert_not_called()
-
-    def test_skips_checks_when_launches_are_mocked(self):
-        with (
-            unittest.mock.patch.object(bg_mod.subprocess, "Popen", object()),
             unittest.mock.patch.object(bg_mod.subprocess, "run") as run,
         ):
             bg_mod._ensure_background_daemons()

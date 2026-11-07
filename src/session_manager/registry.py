@@ -1,0 +1,182 @@
+"""Thread-safe window identity for a restore run.
+
+Restore used to launch a window, place it, and only then launch the next one.
+Materialization separates launching from placing: independent windows are
+launched in parallel, and the arrangement walk consumes the resulting ids.
+
+That makes the claim set and the saved-node map shared across threads, so both
+live behind a lock rather than relying on the interpreter.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Callable, Iterator, MutableSet
+from concurrent.futures import ThreadPoolExecutor
+
+from .config import MATERIALIZE_WORKERS
+
+log = logging.getLogger("session_manager")
+
+
+class ClaimedWindows(MutableSet[int]):
+    """The live window ids already assigned to a saved window.
+
+    A window is claimed exactly once. Two launches that map at the same time
+    must not both see the same id as free, so membership and insertion are
+    guarded by one lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ids: set[int] = set()
+
+    def __contains__(self, value: object) -> bool:
+        with self._lock:
+            return value in self._ids
+
+    def __iter__(self) -> Iterator[int]:
+        with self._lock:
+            snapshot = set(self._ids)
+        return iter(snapshot)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._ids)
+
+    def add(self, value: int) -> None:
+        with self._lock:
+            self._ids.add(value)
+
+    def discard(self, value: int) -> None:
+        with self._lock:
+            self._ids.discard(value)
+
+
+class WindowRegistry:
+    """Map each saved node to the live window that represents it.
+
+    Launch units are submitted to a bounded pool. Every node covered by a
+    unit shares one event, so a caller can wait for exactly the window it
+    needs instead of for the whole session. A node that was never submitted
+    is reported as unmaterialized, which lets callers fall back to launching
+    on demand.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: dict[int, threading.Event] = {}
+        self._results: dict[int, int | None] = {}
+        self._pids: dict[int, int] = {}
+        self._times: dict[int, float] = {}
+        self._pool = ThreadPoolExecutor(
+            max_workers=MATERIALIZE_WORKERS, thread_name_prefix="session-materialize"
+        )
+
+    def submit(self, nodes: list[dict], task: Callable[[], None]) -> threading.Event:
+        """Run `task` in the pool and associate its result with `nodes`.
+
+        The returned event is set when the task finishes, whether or not it
+        recorded ids for every node.
+        """
+        done = threading.Event()
+        with self._lock:
+            for node in nodes:
+                key = id(node)
+                self._events[key] = done
+                self._results[key] = None
+
+        def run() -> None:
+            """Run the unit and release every node waiting on it."""
+            try:
+                task()
+            except Exception:
+                log.exception("Materialization unit failed")
+            finally:
+                done.set()
+
+        self._pool.submit(run)
+        return done
+
+    def record(self, node: dict, win_id: int | None, pid: int | None = None) -> None:
+        """Record the live id assigned to a saved node.
+
+        `pid` is the pid of the window that the launch bound. An application
+        can replace its window, but the pid of the new window stays the
+        same. The pid therefore finds the replacement window.
+        """
+        with self._lock:
+            self._results[id(node)] = win_id
+            self._times[id(node)] = time.monotonic()
+            if pid:
+                self._pids[id(node)] = pid
+
+    def pid(self, node: dict) -> int | None:
+        """Return the pid recorded for a node's window, or None."""
+        with self._lock:
+            return self._pids.get(id(node))
+
+    def age(self, node: dict) -> float | None:
+        """Return the time since the launch bound the node's window.
+
+        Returns:
+            The time in seconds, or None when a launch did not bind the
+            node. A window that the restore adopted from the live tree has
+            no bind time. Its application is past the time when it can
+            replace its window.
+        """
+        with self._lock:
+            bound_at = self._times.get(id(node))
+        if bound_at is None:
+            return None
+        return time.monotonic() - bound_at
+
+    def rebind(self, node: dict, win_id: int) -> None:
+        """Bind a saved node to a different live window.
+
+        The recorded pid stays the same. Only the container id changes. The
+        bind time is renewed, because the replacement window has only just
+        mapped.
+        """
+        with self._lock:
+            self._results[id(node)] = win_id
+            self._times[id(node)] = time.monotonic()
+
+    def adopt(self, node: dict, win_id: int) -> None:
+        """Bind a saved node to a live window that is already there.
+
+        A restore over a session that partly survived, such as one that was
+        interrupted mid-run, reuses those windows instead of launching
+        duplicates. The node counts as materialized because it needs no
+        launch.
+        """
+        done = threading.Event()
+        done.set()
+        with self._lock:
+            self._events[id(node)] = done
+            self._results[id(node)] = win_id
+
+    def has(self, node: dict) -> bool:
+        """Report whether this node was submitted for materialization."""
+        with self._lock:
+            return id(node) in self._events
+
+    def resolve(self, node: dict) -> int | None:
+        """Wait for the node's launch unit and return its live window id.
+
+        Raises:
+            KeyError: The node was never submitted.
+        """
+        with self._lock:
+            done = self._events.get(id(node))
+        if done is None:
+            raise KeyError(f"node was not materialized: {node.get('name')!r}")
+        done.wait()
+        with self._lock:
+            return self._results.get(id(node))
+
+    def close(self) -> None:
+        """Wait for in-flight launches and stop the pool."""
+        self._pool.shutdown(wait=True, cancel_futures=True)

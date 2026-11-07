@@ -3,28 +3,34 @@
 import tempfile
 import unittest
 import unittest.mock
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import session_manager.apps.calibre as calibre_mod
 import session_manager.apps.generic as gen_mod
-import session_manager.apps.kitty as kitty_mod
-import session_manager.apps.mpv as mpv_mod
-import session_manager.apps.thunar as thunar_mod
-import session_manager.apps.zathura as zathura_mod
+import session_manager.apps.handlers as handlers_mod
+from session_manager.apps.handlers import handler_for
 from tests.helpers import FakeWatcher, RecordingPopen
 
 
 class TestGetCmdFromAppId(unittest.TestCase):
     def test_known_app_id_command(self):
-        self.assertEqual(gen_mod.get_cmd_from_app_id("thunar", ""), ["thunar"])
+        self.assertEqual(gen_mod.get_cmd_from_app_id("vesktop", ""), ["vesktop"])
         self.assertEqual(
-            gen_mod.get_cmd_from_app_id("org.pwmt.zathura", ""), ["zathura"]
+            gen_mod.get_cmd_from_app_id("org.keepassxc.KeePassXC", ""),
+            ["gtk-launch", "org.keepassxc.KeePassXC"],
         )
 
-    def test_kitty_returns_none(self):
-        self.assertIsNone(gen_mod.get_cmd_from_app_id("kitty", ""))
-        self.assertIsNone(gen_mod.get_cmd_from_app_id("kitty_drop", ""))
+    def test_dedicated_launchers_return_none(self):
+        for app_id in (
+            "kitty",
+            "kitty_drop",
+            "thunar",
+            "org.pwmt.zathura",
+            "mpv",
+            "helium",
+        ):
+            self.assertIsNone(gen_mod.get_cmd_from_app_id(app_id, ""))
 
     def test_unknown_returns_empty(self):
         # Unknown app without desktop file returns empty sentinel (not None).
@@ -51,6 +57,22 @@ class TestGetCmdFromAppId(unittest.TestCase):
                 self.assertEqual(
                     gen_mod.get_cmd_from_app_id("", "sm_test_app"),
                     ["gtk-launch", "sm_test_app"],
+                )
+
+    def test_a_mixed_case_desktop_id_is_found(self):
+        """Desktop entry names keep the case their vendor chose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            user_apps = Path(tmp) / ".local" / "share" / "applications"
+            user_apps.mkdir(parents=True)
+            (user_apps / "org.example.MixedCase.desktop").write_text(
+                "[Desktop Entry]\n", encoding="utf-8"
+            )
+            with unittest.mock.patch.object(
+                gen_mod.Path, "home", classmethod(lambda cls: Path(tmp))
+            ):
+                self.assertEqual(
+                    gen_mod.get_cmd_from_app_id("org.example.mixedcase", ""),
+                    ["gtk-launch", "org.example.MixedCase"],
                 )
 
 
@@ -270,19 +292,24 @@ class TestWaitForAppWindow(unittest.TestCase):
 
 class TestLaunchDispatch(unittest.TestCase):
     def test_dedicated_launchers_are_used(self):
-        cases = [
-            ("kitty", kitty_mod, "launch_kitty"),
-            ("kitty_drop", kitty_mod, "launch_kitty_drop"),
-            ("zathura", zathura_mod, "launch_zathura"),
-            ("calibre-ebook-viewer", calibre_mod, "launch_ebook_viewer"),
-            ("thunar", thunar_mod, "launch_thunar"),
-            ("mpv", mpv_mod, "launch_mpv"),
-        ]
-        for app_id, module, name in cases:
+        for app_id in (
+            "kitty",
+            "kitty_drop",
+            "org.pwmt.zathura",
+            "calibre-ebook-viewer",
+            "thunar",
+            "mpv",
+        ):
             with self.subTest(app_id=app_id):
+                # The handler table holds the launcher, so substituting one
+                # means substituting the table entry it is recorded in.
+                launcher = unittest.mock.Mock(return_value=11)
+                entry = replace(handler_for(app_id), launch=launcher)
                 with unittest.mock.patch.object(
-                    module, name, return_value=11
-                ) as launcher:
+                    handlers_mod,
+                    "_TABLE",
+                    {**handlers_mod._TABLE, app_id: entry},
+                ):
                     result = gen_mod.launch_and_get_id(
                         {"app_id": app_id}, claimed_ids=set()
                     )
@@ -320,6 +347,41 @@ class TestLaunchDispatch(unittest.TestCase):
         self.assertEqual(result, 12)
         self.assertEqual(claimed, {12})
         self.assertEqual(popen.commands, [["some-app"]])
+
+    def test_a_gtk_launch_command_does_not_fail_fast_on_exit(self):
+        """`gtk-launch` exits before the app's window appears."""
+        with (
+            unittest.mock.patch.object(
+                gen_mod,
+                "get_cmd_from_app_id",
+                return_value=["gtk-launch", "org.keepassxc.KeePassXC"],
+            ),
+            unittest.mock.patch.object(gen_mod, "matching_window_ids", return_value=[]),
+            unittest.mock.patch.object(gen_mod.subprocess, "Popen", RecordingPopen()),
+            unittest.mock.patch.object(gen_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=12
+            ) as wait,
+        ):
+            gen_mod.launch_and_get_id(
+                {"app_id": "org.keepassxc.KeePassXC", "class": ""}, set()
+            )
+        self.assertFalse(wait.call_args.kwargs["fail_fast_on_exit"])
+
+    def test_a_direct_command_fails_fast_when_the_process_exits(self):
+        with (
+            unittest.mock.patch.object(
+                gen_mod, "get_cmd_from_app_id", return_value=["vesktop"]
+            ),
+            unittest.mock.patch.object(gen_mod, "matching_window_ids", return_value=[]),
+            unittest.mock.patch.object(gen_mod.subprocess, "Popen", RecordingPopen()),
+            unittest.mock.patch.object(gen_mod, "WindowEventWatcher", FakeWatcher),
+            unittest.mock.patch.object(
+                gen_mod, "wait_for_app_window", return_value=12
+            ) as wait,
+        ):
+            gen_mod.launch_and_get_id({"app_id": "vesktop", "class": ""}, set())
+        self.assertTrue(wait.call_args.kwargs["fail_fast_on_exit"])
 
     def test_singleton_app_is_not_launched_twice(self):
         with (

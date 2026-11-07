@@ -6,11 +6,13 @@ import logging
 import shlex
 import subprocess
 import time
+from collections.abc import MutableSet
 from pathlib import Path
 
 from ..config import (
     APP_ID_COMMANDS,
     APP_PROFILES,
+    APP_WAIT_TIMEOUT,
     DEFAULT_APP_PROFILE,
     WINDOW_SETTLE_POLL_INTERVAL,
     WINDOW_TREE_SCAN_INTERVAL,
@@ -21,6 +23,7 @@ from ..ipc import (
     get_tree,
     matches_app,
     matching_window_ids,
+    node_app_id,
     node_pid,
     walk_tree,
 )
@@ -28,14 +31,33 @@ from ._common import reap_if_needed
 
 log = logging.getLogger("session_manager")
 
-__all__ = [
-    "find_unclaimed_window",
-    "get_cmd_from_app_id",
-    "launch_and_get_id",
-    "matching_window_ids",
-    "wait_for_app_window",
-    "wait_for_window_by_pid",
-]
+
+def _desktop_entry(candidate: str) -> str:
+    """Return the desktop entry id for a candidate, if there is one.
+
+    Desktop entry names keep the case their vendor chose, so an id that is
+    only known in lower case still has to find its file. The name that is
+    returned is the one on disk, because `gtk-launch` needs it.
+    """
+    if not candidate:
+        return ""
+    for apps_dir in (
+        Path.home() / ".local" / "share" / "applications",
+        Path("/usr/share/applications"),
+    ):
+        direct = apps_dir / f"{candidate}.desktop"
+        if direct.exists():
+            return candidate
+        try:
+            entries = sorted(apps_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.name.endswith(".desktop"):
+                continue
+            if entry.name[: -len(".desktop")].lower() == candidate.lower():
+                return entry.name[: -len(".desktop")]
+    return ""
 
 
 def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
@@ -44,22 +66,20 @@ def get_cmd_from_app_id(app_id: str, class_name: str) -> list[str] | None:
     Return None for apps that have a dedicated launcher.
     """
     canonical = canonical_app_id(app_id)
-    if canonical in ("kitty", "kitty_drop"):
+    # The handler table is the single list of apps that have their own
+    # launcher; only the fallback handler starts from a command.
+    from .handlers import handler_for
+
+    if handler_for(canonical).dedicated:
         return None
     cmd = APP_ID_COMMANDS.get(canonical)
     if cmd:
         return shlex.split(cmd)
     desktop_id = canonical or class_name
-    if desktop_id:
-        for candidate in (desktop_id, desktop_id.lower(), class_name.lower()):
-            if not candidate:
-                continue
-            for apps_dir in (
-                Path.home() / ".local" / "share" / "applications",
-                Path("/usr/share/applications"),
-            ):
-                if (apps_dir / f"{candidate}.desktop").exists():
-                    return ["gtk-launch", candidate]
+    for candidate in (desktop_id, class_name):
+        found = _desktop_entry(candidate)
+        if found:
+            return ["gtk-launch", found]
     return []
 
 
@@ -68,7 +88,7 @@ def find_unclaimed_window(
     class_name: str,
     baseline_ids: set[int] | None = None,
     reject_floating: bool = False,
-    claimed_ids: set[int] | None = None,
+    claimed_ids: MutableSet[int] | None = None,
 ) -> int | None:
     """Return an unclaimed live window that matches an app identity."""
     baseline = baseline_ids or set()
@@ -92,11 +112,8 @@ def _process_exited(process: object | None) -> bool:
     """Report whether a launched process has exited."""
     if process is None:
         return False
-    poll = getattr(process, "poll", None)
-    if not callable(poll):
-        return False
     try:
-        return poll() is not None
+        return process.poll() is not None  # type: ignore[attr-defined]
     except OSError:
         return True
 
@@ -106,11 +123,11 @@ def wait_for_app_window(
     class_name: str,
     watcher: WindowEventWatcher,
     *,
-    settle: float = 0.3,
-    reject_floating: bool = False,
-    timeout: float = 20.0,
+    settle: float = DEFAULT_APP_PROFILE["settle"],
+    reject_floating: bool = DEFAULT_APP_PROFILE["reject_floating"],
+    timeout: float = DEFAULT_APP_PROFILE["timeout"],
     baseline_ids: set[int] | None = None,
-    claimed_ids: set[int] | None = None,
+    claimed_ids: MutableSet[int] | None = None,
     process: object | None = None,
     fail_fast_on_exit: bool = False,
 ) -> int | None:
@@ -180,9 +197,23 @@ def wait_for_app_window(
     )
 
 
-def _window_with_pid(pid: int, app_id: str) -> int | None:
-    """Return a live window owned by pid, or None."""
-    for n in walk_tree(get_tree()):
+def window_with_pid(pid: int, app_id: str, tree: dict | None = None) -> int | None:
+    """Return the id of the live window that `pid` owns, or None.
+
+    A caller can supply the tree that it has read already. This prevents a
+    second read of the tree.
+
+    Args:
+        pid: The pid of the process that owns the window.
+        app_id: The app identity that the window must have.
+        tree: A tree that the caller read already, or None to read one.
+
+    Returns:
+        The id of the window, or None when no window matches.
+    """
+    if tree is None:
+        tree = get_tree()
+    for n in walk_tree(tree):
         if (
             n.get("type") in ("con", "floating_con")
             and node_pid(n) == pid
@@ -198,7 +229,7 @@ def wait_for_window_by_pid(
     pid: int,
     app_id: str,
     *,
-    timeout: float = 15.0,
+    timeout: float = APP_WAIT_TIMEOUT,
     process: object | None = None,
     fail_fast_on_exit: bool = False,
 ) -> int | None:
@@ -227,39 +258,30 @@ def wait_for_window_by_pid(
 
         now = time.monotonic()
         if now >= next_scan:
-            found = _window_with_pid(pid, app_id)
+            found = window_with_pid(pid, app_id)
             if found is not None:
                 return found
             next_scan = now + WINDOW_TREE_SCAN_INTERVAL
 
-    return _window_with_pid(pid, app_id)
+    return window_with_pid(pid, app_id)
 
 
-def launch_and_get_id(node: dict, claimed_ids: set[int]) -> int | None:
+def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
     """Launch or locate the window for a saved node."""
-    from .calibre import launch_ebook_viewer
-    from .kitty import launch_kitty, launch_kitty_drop
-    from .mpv import launch_mpv
-    from .thunar import launch_thunar
-    from .zathura import launch_zathura
+    from .handlers import handler_for
 
-    app_id = canonical_app_id(node.get("app_id", ""))
-    class_name = node.get("class", "")
-
-    if app_id == "helium":
+    # A saved window always carries an app_id, but a hand-written or older
+    # payload may only have its WM_CLASS; node_app_id falls back to it.
+    handler = handler_for(node_app_id(node))
+    if handler.launch is None:
         return None
-    if app_id == "kitty":
-        return launch_kitty(node, claimed_ids)
-    if app_id == "kitty_drop":
-        return launch_kitty_drop(node, claimed_ids)
-    if app_id == "org.pwmt.zathura":
-        return launch_zathura(node, claimed_ids)
-    if app_id == "calibre-ebook-viewer":
-        return launch_ebook_viewer(node, claimed_ids)
-    if app_id == "thunar":
-        return launch_thunar(node, claimed_ids)
-    if app_id == "mpv":
-        return launch_mpv(node, claimed_ids)
+    return handler.launch(node, claimed_ids)
+
+
+def launch_generic(node: dict, claimed_ids: MutableSet[int]) -> int | None:
+    """Launch an app from its command or desktop entry, and return its window."""
+    app_id = node_app_id(node)
+    class_name = node.get("class", "")
 
     cmd_args = get_cmd_from_app_id(app_id, class_name)
     if not cmd_args:
@@ -271,6 +293,11 @@ def launch_and_get_id(node: dict, claimed_ids: set[int]) -> int | None:
     if profile.get("singleton") and baseline_ids:
         log.info("Skipping %s: instance already exists", app_id)
         return None
+
+    # `gtk-launch` starts the app and exits straight away, so its process is
+    # gone before the window appears. Treating that exit as a failed launch
+    # would abandon the app while it is still starting.
+    fail_fast_on_exit = app_id in APP_ID_COMMANDS and cmd_args[0] != "gtk-launch"
 
     win_id = None
     proc = None
@@ -292,7 +319,7 @@ def launch_and_get_id(node: dict, claimed_ids: set[int]) -> int | None:
                 baseline_ids=baseline_ids,
                 claimed_ids=claimed_ids,
                 process=proc,
-                fail_fast_on_exit=app_id in APP_ID_COMMANDS,
+                fail_fast_on_exit=fail_fast_on_exit,
             )
         finally:
             reap_if_needed(proc)
