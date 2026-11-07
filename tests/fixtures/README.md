@@ -24,7 +24,8 @@ floats, a fullscreen window, and marks.
 
 Every path, title, and pid in the fixture is invented. The saved cwd values
 are `/home/example`, the saved documents are `book-a.pdf` to `book-e.epub`,
-and the saved pid is 0. The fixture therefore describes no real desktop.
+the media file is `/tmp/session-manager-fixture/heavy_media.webm`, and the
+saved pid is 0. The fixture therefore describes no real desktop.
 
 `heavy_media.webm` is a 30-minute black clip so mpv stays open instead of
 exiting after a short sound file. Regenerate it with:
@@ -34,8 +35,12 @@ ffmpeg -f lavfi -i color=c=black:s=32x18:r=1 -t 1800 \
   -c:v libvpx-vp9 -b:v 1k -an tests/fixtures/heavy_media.webm
 ```
 
-The fixture stores the media file's absolute path, so regenerate the JSON if
-the checkout moves.
+Copy it to the path the fixture expects before a restore:
+
+```sh
+mkdir -p /tmp/session-manager-fixture
+cp tests/fixtures/heavy_media.webm /tmp/session-manager-fixture/
+```
 
 Install it as the live state file, then restore:
 

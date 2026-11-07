@@ -242,7 +242,7 @@
           "marks": [],
           "border": "pixel",
           "scratchpad_state": "none",
-          "media_path": "/home/example/Projects/github/athaurian/session-manager/tests/fixtures/heavy_media.webm",
+          "media_path": "/tmp/session-manager-fixture/heavy_media.webm",
           "percent": 0.4
         },
         {
