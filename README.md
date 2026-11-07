@@ -92,6 +92,29 @@ session holds the windows saved on every other workspace. The browser windows
 of the selected workspace come back blank instead, because the compositor does
 not expose their URLs.
 
+### Exit codes
+
+| Command     | Exit 0                                        | Exit 1                                                                                                                |
+| ----------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `save`      | The snapshot was written.                     | The compositor could not be reached, or the state file could not be written.                                          |
+| `restore`   | The command ran.                              | Never.                                                                                                                |
+| `has-session` | The saved session holds restorable content. | There is nothing to restore, or the state file is missing, unreadable, non-UTF-8, or a version this build cannot read. |
+| `diff`      | Both sides were read.                         | The saved session or the live tree could not be read.                                                                 |
+
+`restore` reports what it could not bring back in the log and in a desktop
+notification, so it exits 0 after a partial restore and after a refused one.
+Run `has-session` first when a script needs a non-zero signal.
+
+### Environment variables
+
+| Variable                        | Effect                                                                                             |
+| ------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `SESSION_MANAGER_BACKEND`       | Forces the backend to `sway` or `i3`. Wins over every detected signal.                             |
+| `SESSION_MANAGER_SOCK`          | Pins the IPC socket path.                                                                          |
+| `SWAY_SESSION_IPC_REQUEST_TIMEOUT` | Seconds one IPC request waits for a reply. Default `1.0`. Invalid values fall back to the default. |
+| `XDG_STATE_HOME`                | Where the state file lives. Default `~/.local/state`. Read at start-up.                            |
+| `SWAY_SESSION_SKIP_DAEMON_CHECKS` | Set to `1` to skip the background daemon health checks. Used by the test suite and isolated runs. |
+
 ### State files
 
 - Sway: `~/.local/state/sway_session.json`
@@ -103,8 +126,9 @@ saves are kept next to the state file as `.1`, `.2`, and `.3`, where `.1` is
 the most recent.
 
 - Background app compatibility output: `sway_session_background_apps.json`,
-  `i3_session_background_apps.json`. `restore` reads these only when the main
-  state file was written before it carried the `background_apps` list.
+  `i3_session_background_apps.json`. The main state file is authoritative and
+  `restore` reads the background apps from it. The sidecar is written for
+  callers that ask for the background list without naming a file.
 
 ## Supported window managers
 
@@ -129,12 +153,15 @@ environment identifies the compositor. A systemd session unit does this through
 
 The tool repairs the display variables the restored applications need:
 
-- `DISPLAY` on i3.
-- `WAYLAND_DISPLAY` on Sway.
+- `DISPLAY`, `XAUTHORITY`, and `I3SOCK` on i3.
+- `WAYLAND_DISPLAY`, `XAUTHORITY`, `SWAYSOCK`, and `XDG_RUNTIME_DIR` on Sway.
 
 It takes these from the running compositor when the caller does not have them.
-A caller with no environment at all, such as plain cron, cannot tell Sway from
-i3 and is not supported.
+A caller with no environment at all, such as plain cron, is supported: the
+compositor is found by process name and its sockets are read from the system.
+A value the caller already has is kept, and a `SWAYSOCK` that disagrees with
+the compositor is reported. On Sway a stale `WAYLAND_DISPLAY` is kept without
+a warning, because that variable is only filled when it is missing.
 
 ## Restorables
 
@@ -158,10 +185,59 @@ i3 and is not supported.
 - Transient helper terminals (short-lived terminals opened by scripts) are
   intentionally not saved.
 
+## Known limitations
+
+- An application that replaces its own window later than one settle time
+  after the restore bound it is reported as missing. A later restore
+  converges.
+- An application that moves its own window after the restore is put back by
+  the next restore. Nothing watches for the move in the background.
+- Helium flushes its own session when its window closes, so a window opened
+  right before a save can be missing from `--restore-last-session`.
+- A scoped `--workspace` restore opens blank Helium windows, because the
+  browser does not expose its URLs to the compositor.
+- A scratchpad group is saved as separate windows. The group's layout is
+  lost, but no window is dropped.
+- i3 geometry is covered only by the container roundtrip.
+- A terminal whose Neovim has no IPC socket saves `nvim_type: unknown`
+  instead of a session, and the terminal still comes back.
+- The state paths are resolved at start-up, so `XDG_STATE_HOME` must be set
+  before the process starts.
+- On Sway a stale `WAYLAND_DISPLAY` is kept without a warning. Only a
+  `SWAYSOCK` disagreement is reported.
+- `restore` exits 0 even when it restores nothing.
+
+## Troubleshooting
+
+If the log says `Cannot reach the window manager`, no IPC socket was
+found. Run the command inside a Sway or i3 login session, or set
+`SESSION_MANAGER_SOCK`.
+
+If the log says `Invalid session file`, the state file is unreadable
+or a later version. The log names the reason, and `has-session`
+exits 1 with a `not restorable` warning.
+
+If a window did not come back, the log lists it under `Windows not
+restored`. The usual causes are a missing application or a window
+that carried no launch command. One damaged window never stops the
+rest of the session. The log shows the repair as
+`Session payload issue: ...`.
+
+If two saves or restores run at once, one waits for the other. The
+lock is a file lock on an open descriptor, so a process that was
+killed leaves no stale lock behind.
+
+If nothing is restorable, check `has-session`. A saved workspace
+with no windows counts as content, but a state file that holds only
+a `_session_restore` staging workspace or only the dropdown terminal
+does not.
+
 ## Development
 
 The restore design and its invariants are documented in
 [`docs/restore-design.md`](docs/restore-design.md).
+
+
 
 The `Makefile` provides these targets:
 

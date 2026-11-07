@@ -1,8 +1,9 @@
 # Restore design
 
 This note records the design reasoning behind the restore rework. It comes from
-the 2026-11-04 architecture discussion that preceded M0–M5, and it is meant to
-outlive the branch-scoped notes in `notes/CONTEXT.md`.
+the 2026-11-04 architecture discussion that preceded M0–M5. The rework is merged
+into `main`, so this note is the durable record; the branch-scoped working notes
+it outlived were local-only and are gone.
 
 The implementation is authoritative. Read this for the shape and the
 invariants, then inspect `src/session_manager/restore.py` for the current
@@ -74,8 +75,10 @@ function names.
    only ever parked with `move scratchpad`, never `scratchpad show`, and the
    park is verified. A window saved visible on a workspace with a non-`none`
    `scratchpad_state` is deliberately re-shown instead: `move scratchpad` and
-   `scratchpad show`, then geometry and fullscreen (`restore.py:1524-1531`).
-   That path has no test of its own; the `hidden_scratchpad` park does.
+   `scratchpad show`, then geometry and fullscreen (`restore.py:1809-1816`).
+   That path has no test of its own; the `hidden_scratchpad` park does. The
+   reverse drift is covered: a live probe moves a placed window into the
+   scratchpad and the next restore brings it back to its saved workspace.
 3. **Every phase is idempotent.** Re-running arrange, decorate, or reconcile
    converges; it never duplicates or toggles.
 4. **Failures are per-window.** One bad node is dropped and reported; it never
@@ -116,17 +119,25 @@ function names.
 
 ## Open gaps
 
-`notes/CONTEXT.md` tracks the current list while the rework branch is open; these
-entries restate the longer-lived gaps worth remembering after it is deleted:
+The gaps below are the longer-lived ones still worth remembering. The rest of
+the working list lived in local-only notes while the rework branch was open,
+and that branch is merged.
 
 - Reconcile repairs workspace placement, not nesting. The container shape is
-  still rebuilt by the walk.
+  still rebuilt by the walk. Reconcile also rebinds a saved node to the live
+  window that replaced it, through the pid, because an application can
+  destroy and recreate its own window at any time.
 - Adoption needs a pid or an exact title match. A relaunched app that renames
   its window is launched again rather than reused.
-- Scratchpad groups are flattened, so their internal layout is lost.
+- Scratchpad groups are flattened, so their internal layout is lost. No
+  window is dropped: the group is saved as separate windows and the restore
+  parks each one.
 - Floating geometry is verified and reapplied on Sway. i3 reports the frame
   rect, so the requested size cannot be compared with the live rect there.
-- `background_apps` is written to both the main state file and a sidecar.
+- `background_apps` is written to both the main state file and a sidecar. The
+  main state file is authoritative and `restore` reads the list from it; the
+  sidecar is compatibility output for a caller that asks without naming a
+  file.
 - The payload is still dict-based at the node level; `Snapshot` is typed only
   at the top level.
 - `_park_in_scratchpad` still polls at 0.05s between its verification
