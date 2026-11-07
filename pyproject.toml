@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "session-manager"
-version = "0.1.0"
+version = "1.0.0"
 description = "Save and restore a Sway or i3 window manager session"
 readme = "README.md"
 requires-python = ">=3.11"
