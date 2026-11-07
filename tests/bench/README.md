@@ -3,7 +3,9 @@
 This harness measures how long a session restore takes against a real, headless
 Sway compositor. It is separate from `tests/integration`: those tests check that
 a roundtrip restores the session correctly, while this benchmark reports
-latency and is too noisy to gate CI.
+latency. The latency itself is too noisy to gate CI on, so the CI job runs a
+single run and gates only on the restore completing cleanly (`ok=True`,
+`exit=0`, every layout check green).
 
 The benchmark runs inside the same Docker image as the Sway integration tests.
 Fake apps launch `foot` windows with controlled delays, so a run models a slow

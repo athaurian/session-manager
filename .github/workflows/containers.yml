@@ -1,0 +1,26 @@
+name: containers
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The runner image ships Docker, and the scripts build the i3 and Sway
+      # images themselves. Both roundtrips run with the network disabled.
+      - name: i3 and Sway roundtrips
+        run: make integration
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The restore latency is far too noisy to gate on, so this job proves
+      # the harness still completes a restore cleanly: one run, and it must
+      # report ok with every layout check green.
+      - name: restore benchmark smoke run
+        run: make bench ARGS="--runs 1"
