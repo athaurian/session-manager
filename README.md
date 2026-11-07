@@ -189,57 +189,43 @@ a warning, because that variable is only filled when it is missing.
 
 ## Known limitations
 
-- An application that replaces its own window later than one settle time
-  after the restore bound it is reported as missing. A later restore
-  converges.
-- An application that moves its own window after the restore is put back by
-  the next restore. Nothing watches for the move in the background.
-- Helium flushes its own session when its window closes, so a window opened
-  right before a save can be missing from `--restore-last-session`.
-- A scoped `--workspace` restore opens blank Helium windows, because the
-  browser does not expose its URLs to the compositor.
-- A scratchpad group is saved as separate windows. The group's layout is
-  lost, but no window is dropped.
-- i3 geometry is covered only by the container roundtrip.
-- A terminal whose Neovim has no IPC socket saves `nvim_type: unknown`
-  instead of a session, and the terminal still comes back.
-- The state paths are resolved at start-up, so `XDG_STATE_HOME` must be set
-  before the process starts.
-- On Sway a stale `WAYLAND_DISPLAY` is kept without a warning. Only a
-  `SWAYSOCK` disagreement is reported.
-- `restore` exits 0 even when it restores nothing.
+- If an application swaps in a new window after `restore` has already matched
+  it, the restore reports the window as missing. Running `restore` again
+  usually brings it back.
+- If an application moves its window after `restore` places it, the next
+  restore puts it back. Nothing watches for the move in the background.
+- Helium saves its session when its window closes. A window opened right
+  before `save` can be missing when `restore` reopens the browser with
+  `--restore-last-session`.
+- A `--workspace` restore opens blank Helium windows. The browser does not
+  tell the compositor which pages its windows show.
+- A scratchpad group is saved as separate windows. The way the windows were
+  grouped is lost, but no window is dropped.
+- The i3 window positions and sizes are tested only in the container
+  roundtrip.
+- If a terminal's Neovim has no IPC socket, `save` records `nvim_type:
+  unknown` instead of a session. The terminal still comes back.
+- The state file path is read when the command starts. Set `XDG_STATE_HOME`
+  before you run `save` or `restore`.
+- On Sway, an out-of-date `WAYLAND_DISPLAY` is kept without a warning. Only a
+  `SWAYSOCK` that disagrees with the compositor is reported.
+- `restore` exits 0 when the state file is readable but holds nothing to
+  restore. It exits 1 only when it cannot reach the compositor.
 
 ## Troubleshooting
 
-If the log says `Cannot reach the window manager`, no IPC socket was
-found. Run the command inside a Sway or i3 login session, or set
-`SESSION_MANAGER_SOCK`.
-
-If the log says `Invalid session file`, the state file is unreadable
-or a later version. The log names the reason, and `has-session`
-exits 1 with a `not restorable` warning.
-
-If a window did not come back, the log lists it under `Windows not
-restored`. The usual causes are a missing application or a window
-that carried no launch command. One damaged window never stops the
-rest of the session. The log shows the repair as
-`Session payload issue: ...`.
-
-If two saves or restores run at once, one waits for the other. The
-lock is a file lock on an open descriptor, so a process that was
-killed leaves no stale lock behind.
-
-If nothing is restorable, check `has-session`. A saved workspace
-with no windows counts as content, but a state file that holds only
-a `_session_restore` staging workspace or only the dropdown terminal
-does not.
+| Symptom                                         | What to do                                                                                                                                                                                                                                   |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The log says `Cannot reach the window manager`. | Run the command inside a Sway or i3 login session, or set `SESSION_MANAGER_SOCK`.                                                                                                                                                            |
+| The log says `Invalid session file`.            | The state file is unreadable or a later version. Read the reason in the log. `has-session` exits 1 with a `not restorable` warning.                                                                                                          |
+| A window did not come back.                     | Look for `Windows not restored` in the log. The usual causes are a missing application or a window with no launch command. One damaged window never stops the rest of the session. The log shows the repair as `Session payload issue: ...`. |
+| Two saves or restores run at once.              | One waits for the other. Nothing to do. The lock is a file lock on an open descriptor, so a killed process leaves no stale lock behind.                                                                                                      |
+| Nothing is restorable.                          | Check `has-session`. A saved workspace with no windows counts as content, but a file that holds only a `_session_restore` staging workspace or only the dropdown terminal does not.                                                          |
 
 ## Development
 
 The restore design and its invariants are documented in
 [`docs/restore-design.md`](docs/restore-design.md).
-
-
 
 The `Makefile` provides these targets:
 

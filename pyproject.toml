@@ -31,7 +31,6 @@ Homepage = "https://github.com/athaurian/session-manager"
 Repository = "https://github.com/athaurian/session-manager"
 Issues = "https://github.com/athaurian/session-manager/issues"
 
-
 [project.scripts]
 session-manager = "session_manager.__main__:main"
 
