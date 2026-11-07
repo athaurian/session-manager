@@ -9,7 +9,7 @@ import json
 import tempfile
 import unittest
 import unittest.mock
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import session_manager.restore as restore_mod
@@ -17,6 +17,7 @@ import session_manager.save as save_mod
 from session_manager.__main__ import main
 from session_manager.ipc import IpcError
 from session_manager.restore import restore_session
+from tests.helpers import make_window, make_workspace
 
 
 class TestUnreachableCompositor(unittest.TestCase):
@@ -269,6 +270,182 @@ class TestRestoreFailsFast(unittest.TestCase):
             restore_session(notify_user=True)
         notify.assert_called_once()
         self.assertIn("cannot reach the window manager", notify.call_args.args[0])
+
+
+class TestHasSessionExitCodes(unittest.TestCase):
+    """The login prompt reads only the exit code of `has-session`.
+
+    These cases run the real `has_restorable_content` against real state
+    files, so the command proves the prompt's contract end to end.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_dir = Path(self.tmp.name) / "state"
+        self.state_dir.mkdir()
+        self.state_file = self.state_dir / "sway_session.json"
+
+    def _run(self, action="has-session"):
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        code = 0
+        with (
+            unittest.mock.patch("sys.argv", ["session_manager", action]),
+            unittest.mock.patch.object(restore_mod, "apply_compositor_env"),
+            unittest.mock.patch.object(restore_mod, "notify"),
+            redirect_stderr(stderr),
+            redirect_stdout(stdout),
+        ):
+            try:
+                main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _write(self, payload):
+        self.state_file.write_text(
+            payload if isinstance(payload, str) else json.dumps(payload),
+            encoding="utf-8",
+        )
+
+    def payload(self, workspaces=(), hidden=(), background=None, version=3):
+        return {
+            "version": version,
+            "workspaces": list(workspaces),
+            "hidden_scratchpad": list(hidden),
+            "background_apps": background,
+        }
+
+    @contextmanager
+    def _patch_state(self):
+        with unittest.mock.patch.object(restore_mod, "STATE_FILE", self.state_file):
+            yield
+
+    def test_missing_state_file_exits_one(self):
+        with self._patch_state():
+            code, stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+
+    def test_empty_session_exits_one(self):
+        """No workspace, no parked window, and no background app."""
+        self._write(self.payload())
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+
+    def test_empty_workspace_exits_zero(self):
+        """A restore recreates the workspace, so the prompt still asks."""
+        self._write(self.payload(workspaces=[make_workspace("1")]))
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 0)
+
+    def test_legacy_empty_list_exits_one(self):
+        self._write([])
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+
+    def test_parked_drop_terminal_alone_exits_one(self):
+        """The dropdown respawns from its keybind, so it is not content."""
+        self._write(self.payload(hidden=[make_window("kitty_drop", name="drop_term")]))
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+
+    def test_leftover_staging_workspace_exits_one(self):
+        """A state file saved during an interrupted restore holds no content."""
+        self._write(self.payload(workspaces=[make_workspace("_session_restore")]))
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+
+    def test_saved_window_exits_zero(self):
+        self._write(
+            self.payload(workspaces=[make_workspace("1", nodes=[make_window("kitty")])])
+        )
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 0)
+
+    def test_parked_window_exits_zero(self):
+        self._write(self.payload(hidden=[make_window("kitty")]))
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 0)
+
+    def test_background_app_alone_exits_zero(self):
+        self._write(self.payload(background=[{"app_id": "vesktop"}]))
+        with self._patch_state():
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 0)
+
+    def test_unreadable_state_file_exits_one_with_a_message(self):
+        self._write("{ not valid json")
+        with (
+            self._patch_state(),
+            self.assertLogs("session_manager", level="WARNING") as logs,
+        ):
+            code, _stdout, stderr = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("not restorable", "\n".join(logs.output))
+        self.assertNotIn("Traceback", stderr)
+
+    def test_a_file_that_is_not_utf8_exits_one(self):
+        self.state_file.write_bytes(b'{"workspaces": [\xff]}')
+        with (
+            self._patch_state(),
+            self.assertLogs("session_manager", level="WARNING") as logs,
+        ):
+            code, _stdout, stderr = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("not restorable", "\n".join(logs.output))
+        self.assertNotIn("Traceback", stderr)
+
+    def test_unsupported_version_exits_one(self):
+        self._write(
+            self.payload(
+                workspaces=[make_workspace("1", nodes=[make_window("kitty")])],
+                version=4,
+            )
+        )
+        with (
+            self._patch_state(),
+            self.assertLogs("session_manager", level="WARNING") as logs,
+        ):
+            code, _stdout, _stderr = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("not restorable", "\n".join(logs.output))
+
+    def test_diff_of_an_empty_session_exits_zero(self):
+        self._write(self.payload())
+        with (
+            self._patch_state(),
+            unittest.mock.patch.object(
+                restore_mod,
+                "get_tree",
+                return_value={"nodes": [], "floating_nodes": []},
+            ),
+        ):
+            code, stdout, _stderr = self._run("diff")
+        self.assertEqual(code, 0)
+        self.assertIn("Saved session is empty", stdout)
+
+    def test_diff_of_a_parked_session_reports_the_scratchpad(self):
+        self._write(self.payload(hidden=[make_window("kitty")]))
+        with (
+            self._patch_state(),
+            unittest.mock.patch.object(
+                restore_mod,
+                "get_tree",
+                return_value={"nodes": [], "floating_nodes": []},
+            ),
+        ):
+            code, stdout, _stderr = self._run("diff")
+        self.assertEqual(code, 0)
+        self.assertIn("hidden scratchpad: 1 windows saved", stdout)
 
 
 class TestArgumentWiring(unittest.TestCase):
