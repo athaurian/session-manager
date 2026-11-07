@@ -22,6 +22,10 @@ That is 24 visible windows across 9 workspaces plus 3 hidden scratchpad
 windows. The layout covers nested splits, tabbed and stacked containers,
 floats, a fullscreen window, and marks.
 
+Every path, title, and pid in the fixture is invented. The saved cwd values
+are `/home/example`, the saved documents are `book-a.pdf` to `book-e.epub`,
+and the saved pid is 0. The fixture therefore describes no real desktop.
+
 `heavy_media.webm` is a 30-minute black clip so mpv stays open instead of
 exiting after a short sound file. Regenerate it with:
 
