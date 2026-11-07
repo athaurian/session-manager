@@ -11,6 +11,26 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Hanif Ilham Athaurrahman" }]
+keywords = ["sway", "i3", "wayland", "x11", "window-manager", "session"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Desktop Environment :: Window Managers",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/athaurian/session-manager"
+Repository = "https://github.com/athaurian/session-manager"
+Issues = "https://github.com/athaurian/session-manager/issues"
+
 
 [project.scripts]
 session-manager = "session_manager.__main__:main"
