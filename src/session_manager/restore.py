@@ -765,8 +765,10 @@ def _young_windows(placed: list[tuple[dict, int]], ctx: RestoreContext) -> bool:
     """Report whether a placed window was bound recently.
 
     An application can replace a window a short time after it maps the
-    window. A young window is given two times its settle time before the
-    restore asserts the placement. Thus the restore sees the replacement.
+    window. A young window is given one settle time before the restore
+    asserts the placement. Thus the restore sees the replacement. A
+    replacement that maps later than that is reported as missing, and a
+    later restore converges on it.
 
     A window that the restore adopted is not young. Its application is past
     the time when it can replace the window.
@@ -782,7 +784,7 @@ def _young_windows(placed: list[tuple[dict, int]], ctx: RestoreContext) -> bool:
         age = ctx.registry.age(node)
         if age is None:
             continue
-        if age < 2 * _app_settle(node):
+        if age < _app_settle(node):
             return True
     return False
 
