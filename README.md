@@ -94,16 +94,18 @@ not expose their URLs.
 
 ### Exit codes
 
-| Command     | Exit 0                                        | Exit 1                                                                                                                |
-| ----------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `save`      | The snapshot was written.                     | The compositor could not be reached, or the state file could not be written.                                          |
-| `restore`   | The command ran.                              | Never.                                                                                                                |
-| `has-session` | The saved session holds restorable content. | There is nothing to restore, or the state file is missing, unreadable, non-UTF-8, or a version this build cannot read. |
-| `diff`      | Both sides were read.                         | The saved session or the live tree could not be read.                                                                 |
+| Command       | Exit 0                                        | Exit 1                                                                                                                |
+| ------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `save`        | The snapshot was written.                     | The compositor could not be reached, or the state file could not be written.                                          |
+| `restore`     | The command ran.                              | The compositor could not be reached, or it stopped answering.                                                         |
+| `has-session` | The saved session holds restorable content.   | There is nothing to restore, or the state file is missing, unreadable, non-UTF-8, or a version this build cannot read. |
+| `diff`        | Both sides were read.                         | The saved session or the live tree could not be read.                                                                 |
 
 `restore` reports what it could not bring back in the log and in a desktop
-notification, so it exits 0 after a partial restore and after a refused one.
-Run `has-session` first when a script needs a non-zero signal.
+notification, so it exits 0 after a partial restore, after a refused state
+file, and when no state file exists. Exit 1 means the compositor itself was
+unreachable, so nothing could be placed. Run `has-session` first when a script
+needs a non-zero signal for missing content.
 
 ### Environment variables
 
