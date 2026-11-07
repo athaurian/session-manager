@@ -435,5 +435,160 @@ class TestRegistryFallback(MaterializeHarness):
             registry.resolve(make_window("kitty"))
 
 
+class TestWindowRegistryPids(RegistryTestCase):
+    """The pid stays valid when the container id changes."""
+
+    def test_a_recorded_pid_survives_a_rebind(self):
+        ctx = self.make_context()
+        node = make_window("calibre-gui")
+        ctx.registry.adopt(node, 501)
+        ctx.registry.record(node, 501, pid=777)
+        self.assertEqual(ctx.registry.pid(node), 777)
+
+        ctx.registry.rebind(node, 502)
+
+        self.assertEqual(ctx.registry.resolve(node), 502)
+        self.assertEqual(ctx.registry.pid(node), 777)
+
+    def test_pid_is_unknown_until_a_launch_records_one(self):
+        ctx = self.make_context()
+        node = make_window("kitty")
+        ctx.registry.adopt(node, 501)
+        self.assertIsNone(ctx.registry.pid(node))
+
+    def test_an_adopted_window_has_no_bind_time(self):
+        """A window that the restore adopted is past the replace time."""
+        ctx = self.make_context()
+        node = make_window("kitty")
+        ctx.registry.adopt(node, 501)
+        self.assertIsNone(ctx.registry.age(node))
+
+    def test_a_recorded_window_reports_how_long_ago_it_was_bound(self):
+        ctx = self.make_context()
+        node = make_window("kitty")
+        ctx.registry.adopt(node, 501)
+        ctx.registry.record(node, 501, pid=777)
+        self.assertIsNotNone(ctx.registry.age(node))
+        self.assertLess(ctx.registry.age(node), 1.0)
+
+    def test_a_rebind_renews_the_bind_time(self):
+        """The window that replaced the old one has only just mapped."""
+        ctx = self.make_context()
+        node = make_window("kitty")
+        ctx.registry.adopt(node, 501)
+        ctx.registry.record(node, 501, pid=777)
+        ctx.registry.rebind(node, 502)
+        self.assertLess(ctx.registry.age(node), 1.0)
+        self.assertEqual(ctx.registry.resolve(node), 502)
+        self.assertEqual(ctx.registry.pid(node), 777)
+
+
+class TestRebindDeadWindows(MaterializeHarness):
+    """A window that an application replaced after its launch is placed.
+
+    An application can map a placeholder window and destroy it. The
+    application maps the window that the session saved under the same pid.
+    The launch wait can bind the placeholder. The walk would then place a
+    container id that is already gone.
+    """
+
+    def _tree(self, window: dict) -> dict:
+        """A tree with one output that holds one window on workspace 1."""
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "nodes": [make_workspace("1", nodes=[window])],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def _materialize(self, saved, bound_id, pid, live_ids, claimed=None):
+        """Bind `saved` to container `bound_id` of pid `pid` at launch.
+
+        The tree then holds the windows of `live_ids` only.
+
+        Args:
+            saved: The saved node that the launch binds.
+            bound_id: The id that the launch returns for `saved`.
+            pid: The pid of the window that the launch bound.
+            live_ids: The ids that stay in the tree after the launch.
+            claimed: Ids that other saved nodes claim already.
+        """
+        ctx = self.make_context()
+        for win_id in claimed or ():
+            ctx.claimed_ids.add(win_id)
+
+        def launch(node, claimed_ids):
+            claimed_ids.add(bound_id)
+            return bound_id
+
+        placeholder = self._tree(
+            live_window(bound_id, app_id=saved["app_id"], name="calibre", pid=pid)
+        )
+        replacement = self._tree(
+            live_window(
+                live_ids[0],
+                app_id=saved["app_id"],
+                name="calibre - Library",
+                pid=pid,
+            )
+        )
+        with (
+            unittest.mock.patch.object(restore_mod, "launch_and_get_id", launch),
+            unittest.mock.patch.object(
+                restore_mod, "get_tree", side_effect=[placeholder, replacement]
+            ),
+        ):
+            restore_mod._materialize([saved], ctx)
+        return ctx
+
+    def test_window_replaced_under_the_same_pid_is_rebound(self):
+        saved = make_window("calibre-gui", name="calibre")
+        ctx = self._materialize(saved, 501, 777, [502])
+        self.assertEqual(ctx.registry.resolve(saved), 502)
+        self.assertEqual(ctx.registry.pid(saved), 777)
+        self.assertIn(502, ctx.claimed_ids)
+        self.assertNotIn(501, ctx.claimed_ids)
+
+    def test_a_bound_window_that_is_still_live_is_kept(self):
+        saved = make_window("calibre-gui", name="calibre")
+        ctx = self._materialize(saved, 501, 777, [501])
+        self.assertEqual(ctx.registry.resolve(saved), 501)
+        self.assertEqual(ctx.registry.pid(saved), 777)
+        self.assertIn(501, ctx.claimed_ids)
+
+    def test_a_replacement_another_window_owns_is_not_stolen(self):
+        saved = make_window("calibre-gui", name="calibre")
+        ctx = self._materialize(saved, 501, 777, [902], claimed=[902])
+        self.assertEqual(ctx.registry.resolve(saved), 501)
+        self.assertIn(902, ctx.claimed_ids)
+
+    def test_a_window_with_no_pid_is_left_alone(self):
+        """A launch that could not name its window keeps its bound id."""
+        saved = make_window("calibre-gui", name="calibre")
+        ctx = self.make_context()
+
+        def launch(node, claimed_ids):
+            claimed_ids.add(501)
+            return 501
+
+        with (
+            unittest.mock.patch.object(restore_mod, "launch_and_get_id", launch),
+            unittest.mock.patch.object(
+                restore_mod, "get_tree", side_effect=OSError("no socket")
+            ),
+        ):
+            restore_mod._materialize([saved], ctx)
+
+        self.assertEqual(ctx.registry.resolve(saved), 501)
+        self.assertIsNone(ctx.registry.pid(saved))
+
+
 if __name__ == "__main__":
     unittest.main()

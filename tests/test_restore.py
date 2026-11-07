@@ -1,6 +1,7 @@
 """Tests for restore orchestration: payload normalisation, focused-workspace,
 and floating-window restore branches."""
 
+import itertools
 import unittest
 import unittest.mock
 from typing import ClassVar
@@ -1118,11 +1119,55 @@ class TestReconcilePlacements(RestoreHarnessTestCase):
             ctx.registry.adopt(node, win_id)
         return ctx
 
+    def _placements_tree(self, placements):
+        """Build a live tree whose window ids sit on the named workspaces."""
+        by_workspace: dict[str, list[int]] = {}
+        for win_id, name in placements.items():
+            by_workspace.setdefault(name or "unnamed", []).append(win_id)
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": name,
+                            "nodes": [
+                                {"type": "con", "id": win_id, "app_id": "kitty"}
+                                for win_id in sorted(ids)
+                            ],
+                            "floating_nodes": [],
+                        }
+                        for name, ids in by_workspace.items()
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
     def _reconcile(self, ctx, before, after, workspaces=(), hidden=()):
+        """Reconcile with `before` as the first tree and `after` as the last.
+
+        The windows in these tests are adopted and not launched. Thus the
+        rebind pass records no pid for them and reads no tree.
+
+        Args:
+            ctx: The restore context to reconcile through.
+            before: The placements that the first tree read shows.
+            after: The placements that the last tree read shows.
+            workspaces: The saved workspaces of this restore.
+            hidden: The saved scratchpad entries of this restore.
+        """
         with unittest.mock.patch.object(
             self.restore_mod,
-            "_read_window_placements",
-            side_effect=[before, after],
+            "get_tree",
+            side_effect=[
+                self._placements_tree(before),
+                self._placements_tree(after),
+            ],
         ):
             self.restore_mod._reconcile_placements(list(workspaces), list(hidden), ctx)
 
@@ -1187,6 +1232,150 @@ class TestReconcilePlacements(RestoreHarnessTestCase):
         self._reconcile(ctx, {}, {}, workspaces=[ws])
         self.assertEqual(ctx.missing, ["alpha"])
 
+    def _pid_tree(self, win_id, pid, app_id, workspace):
+        """Build a live tree that holds one window which a pid owns.
+
+        Args:
+            win_id: The id of the window.
+            pid: The pid of the process that owns the window.
+            app_id: The app identity of the window.
+            workspace: The name of the workspace that holds the window.
+        """
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": workspace,
+                            "nodes": [
+                                {
+                                    "type": "con",
+                                    "id": win_id,
+                                    "app_id": app_id,
+                                    "name": "calibre",
+                                    "pid": pid,
+                                    "nodes": [],
+                                    "floating_nodes": [],
+                                }
+                            ],
+                            "floating_nodes": [],
+                        }
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def _reconcile_replacement(self, ctx, trees, workspaces):
+        """Reconcile through a fixed sequence of live trees.
+
+        Args:
+            ctx: The restore context to reconcile through.
+            trees: The trees that the successive reads return.
+            workspaces: The saved workspaces of this restore.
+        """
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod, "_pid_is_alive", return_value=True
+            ),
+            unittest.mock.patch.object(self.restore_mod, "get_tree", side_effect=trees),
+        ):
+            self.restore_mod._reconcile_placements(list(workspaces), [], ctx)
+
+    def test_a_replaced_window_is_bound_and_moved_back(self):
+        """The replacement window is put on the saved workspace.
+
+        The walk placed the placeholder window. The placeholder died after
+        the placement. The pass binds the window that is in the tree and
+        moves that window back. The saved window is not reported as missing
+        while its replacement sits on a different workspace.
+        """
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501, pid=777)
+        self._reconcile_replacement(
+            ctx,
+            [
+                # The pid owns no window yet: the replacement is not mapped.
+                self._pid_tree(901, 888, "calibre-gui", "9"),
+                # The replacement maps while the pass waits for it.
+                self._pid_tree(502, 777, "calibre-gui", "1"),
+                # The pass reads the placements, then verifies the move.
+                self._pid_tree(502, 777, "calibre-gui", "1"),
+                self._pid_tree(502, 777, "calibre-gui", "7"),
+            ],
+            [ws],
+        )
+        self.assertEqual(ctx.registry.resolve(win), 502)
+        self.assertEqual(ctx.registry.pid(win), 777)
+        self.assertCommand("[con_id=502] move to workspace 7")
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_replacement_that_maps_during_the_wait_is_awaited(self):
+        """The application maps the replacement after the placeholder dies."""
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501, pid=777)
+        self._reconcile_replacement(
+            ctx,
+            [
+                # The bound container is gone and the pid owns no window.
+                self._placements_tree({}),
+                # The replacement maps while the pass waits for it.
+                self._pid_tree(503, 777, "calibre-gui", "1"),
+                # The pass reads the placements, then verifies the move.
+                self._pid_tree(503, 777, "calibre-gui", "1"),
+                self._pid_tree(503, 777, "calibre-gui", "7"),
+            ],
+            [ws],
+        )
+        self.assertEqual(ctx.registry.resolve(win), 503)
+        self.assertCommand("[con_id=503] move to workspace 7")
+        self.assertEqual(ctx.missing, [])
+        self.assertEqual(ctx.failures, [])
+
+    def test_no_replacement_is_awaited_once_the_process_is_gone(self):
+        """An exited process does not map a replacement window."""
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501, pid=777)
+        with unittest.mock.patch.object(
+            self.restore_mod, "get_tree", return_value=self._placements_tree({})
+        ):
+            self.restore_mod._reconcile_placements([ws], [], ctx)
+        self.assertEqual(ctx.registry.resolve(win), 501)
+        self.assertEqual(ctx.missing, ["calibre"])
+
+    def test_a_replacement_another_window_owns_is_not_stolen(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("7", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501, pid=777)
+        other = make_window("calibre-gui", name="other")
+        ctx.registry.adopt(other, 902)
+        ctx.claimed_ids.add(902)
+        self._reconcile_replacement(
+            ctx,
+            [
+                self._pid_tree(902, 777, "calibre-gui", "7"),
+                self._pid_tree(902, 777, "calibre-gui", "7"),
+                self._pid_tree(902, 777, "calibre-gui", "7"),
+            ],
+            [ws],
+        )
+        self.assertEqual(ctx.registry.resolve(win), 501)
+        self.assertEqual(ctx.registry.resolve(other), 902)
+        self.assertEqual(ctx.missing, ["calibre"])
+
     def test_unmaterialized_node_is_skipped(self):
         win = make_window("kitty", name="alpha")
         ws = make_workspace("1", nodes=[win])
@@ -1200,11 +1389,172 @@ class TestReconcilePlacements(RestoreHarnessTestCase):
         ws = make_workspace("1", nodes=[win])
         ctx = self._ctx((win, 702))
         with unittest.mock.patch.object(
-            self.restore_mod, "_read_window_placements", return_value=None
+            self.restore_mod, "get_tree", side_effect=OSError("no socket")
         ):
             self.restore_mod._reconcile_placements([ws], [], ctx)
         self.assertEqual(ctx.missing, [])
         self.assertEqual(self.calls, [])
+
+
+class TestAwaitStablePlacements(RestoreHarnessTestCase):
+    """The last pass waits until the containers do not change."""
+
+    def _ctx(self, *adopted):
+        ctx = self.restore_mod.RestoreContext()
+        self.addCleanup(ctx.registry.close)
+        for node, win_id in adopted:
+            ctx.registry.adopt(node, win_id)
+        return ctx
+
+    def _window(self, win_id, pid=0, app_id="calibre-gui", name="calibre"):
+        return {
+            "type": "con",
+            "id": win_id,
+            "app_id": app_id,
+            "name": name,
+            "pid": pid,
+            "nodes": [],
+            "floating_nodes": [],
+        }
+
+    def _tree(self, *windows):
+        """A tree with one output that holds `windows` on workspace 1.
+
+        Args:
+            windows: The window containers that workspace 1 holds.
+        """
+        return {
+            "nodes": [
+                {
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "active": True,
+                    "nodes": [
+                        {
+                            "type": "workspace",
+                            "name": "1",
+                            "nodes": list(windows),
+                            "floating_nodes": [],
+                        }
+                    ],
+                    "floating_nodes": [],
+                }
+            ],
+            "floating_nodes": [],
+        }
+
+    def test_a_stable_tree_ends_the_wait_after_two_reads(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        with unittest.mock.patch.object(
+            self.restore_mod, "get_tree", return_value=self._tree(self._window(501))
+        ) as get_tree:
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertEqual(get_tree.call_count, 2)
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_young_window_holds_the_wait_open(self):
+        """A window that an application mapped recently can still change.
+
+        The application can replace a window that it mapped a short time
+        before. A young window holds the wait open until the window is past
+        its settle time or until the deadline ends the wait.
+        """
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501)
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "get_tree",
+                return_value=self._tree(self._window(501)),
+            ) as get_tree,
+            unittest.mock.patch.object(self.restore_mod, "_GEOMETRY_POLL_INTERVAL", 0),
+            unittest.mock.patch.object(
+                self.restore_mod, "_PLACEMENT_SETTLE_TIMEOUT", 0.05
+            ),
+        ):
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertGreater(get_tree.call_count, 2)
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_window_past_its_settle_ends_the_wait(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ctx.registry.record(win, 501)
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "get_tree",
+                return_value=self._tree(self._window(501)),
+            ) as get_tree,
+            unittest.mock.patch.object(ctx.registry, "age", return_value=5.0),
+        ):
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertEqual(get_tree.call_count, 2)
+        self.assertEqual(ctx.failures, [])
+
+    def test_a_replaced_window_keeps_the_wait_running(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        trees = [
+            self._tree(self._window(501)),
+            self._tree(self._window(502)),
+            self._tree(self._window(502)),
+        ]
+        with (
+            unittest.mock.patch.object(self.restore_mod, "get_tree", side_effect=trees),
+            unittest.mock.patch.object(self.restore_mod, "_GEOMETRY_POLL_INTERVAL", 0),
+        ):
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertEqual(ctx.failures, [])
+
+    def test_the_wait_gives_up_at_the_deadline(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        ids = itertools.count(500)
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "get_tree",
+                side_effect=lambda: self._tree(self._window(next(ids))),
+            ),
+            unittest.mock.patch.object(self.restore_mod, "_GEOMETRY_POLL_INTERVAL", 0),
+            unittest.mock.patch.object(
+                self.restore_mod, "_PLACEMENT_SETTLE_TIMEOUT", 0.05
+            ),
+        ):
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertEqual(ctx.failures, [])
+
+    def test_nothing_placed_skips_the_wait(self):
+        ws = make_workspace("1", nodes=[make_window("kitty")])
+        ctx = self._ctx()
+        with unittest.mock.patch.object(self.restore_mod, "get_tree") as get_tree:
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        get_tree.assert_not_called()
+
+    def test_an_unreadable_tree_ends_the_wait(self):
+        win = make_window("calibre-gui", name="calibre")
+        ws = make_workspace("1", nodes=[win])
+        ctx = self._ctx((win, 501))
+        with unittest.mock.patch.object(
+            self.restore_mod, "get_tree", side_effect=OSError("no socket")
+        ):
+            self.restore_mod._await_stable_placements([ws], [], ctx)
+
+        self.assertEqual(ctx.failures, [])
 
 
 class TestRecoverLateWindows(RestoreHarnessTestCase):
@@ -1409,7 +1759,7 @@ class TestRecoverLateWindows(RestoreHarnessTestCase):
             unittest.mock.patch.object(
                 self.restore_mod,
                 "_staging_workspace_names",
-                side_effect=[["_session_restore"], []],
+                side_effect=[[]],
             ),
             unittest.mock.patch.object(
                 self.restore_mod, "_recover_late_windows", return_value=1
@@ -1425,6 +1775,57 @@ class TestRecoverLateWindows(RestoreHarnessTestCase):
         reconcile.assert_called_once()
         self.assertEqual(ctx.failures, [])
 
+    def test_finish_staging_settles_before_the_last_two_passes(self):
+        """A replaced window is repaired and not asserted for a dead id."""
+        ctx = self._ctx()
+        order: list[str] = []
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod, "_staging_workspace_names", side_effect=[[]]
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_await_stable_placements",
+                side_effect=lambda *_a, **_kw: order.append("settle"),
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_reconcile_placements",
+                side_effect=lambda *_a, **_kw: order.append("reconcile"),
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod,
+                "_recover_late_windows",
+                side_effect=lambda *_a, **_kw: order.append("recover"),
+            ),
+        ):
+            self.restore_mod._finish_staging([], [], ctx, "2")
+
+        # The reconciliation binds a replaced window first. Thus the sweep
+        # does not report it as a window that matches no saved window.
+        self.assertEqual(order, ["settle", "reconcile", "recover"])
+        self.assertEqual(ctx.failures, [])
+
+    def test_finish_staging_reconciles_without_a_staging_workspace(self):
+        """A staging workspace that was already swept is no reason to skip."""
+        ctx = self._ctx()
+        with (
+            unittest.mock.patch.object(
+                self.restore_mod, "_staging_workspace_names", side_effect=[[]]
+            ),
+            unittest.mock.patch.object(
+                self.restore_mod, "_recover_late_windows", return_value=0
+            ) as recover,
+            unittest.mock.patch.object(
+                self.restore_mod, "_reconcile_placements"
+            ) as reconcile,
+        ):
+            self.restore_mod._finish_staging([], [], ctx, "2")
+
+        recover.assert_called_once()
+        reconcile.assert_called_once()
+        self.assertEqual(ctx.failures, [])
+
     def test_finish_staging_sweeps_before_switching_away(self):
         """A window that maps during the sweep lands on staging, not the target."""
         ctx = self._ctx()
@@ -1434,7 +1835,7 @@ class TestRecoverLateWindows(RestoreHarnessTestCase):
             unittest.mock.patch.object(
                 self.restore_mod,
                 "_staging_workspace_names",
-                side_effect=[["_session_restore"], []],
+                side_effect=[[]],
             ),
             unittest.mock.patch.object(
                 self.restore_mod,
@@ -1456,7 +1857,7 @@ class TestRecoverLateWindows(RestoreHarnessTestCase):
             unittest.mock.patch.object(
                 self.restore_mod,
                 "_staging_workspace_names",
-                side_effect=[["_session_restore"], ["_session_restore"]],
+                side_effect=[["_session_restore"]],
             ),
             unittest.mock.patch.object(
                 self.restore_mod, "_recover_late_windows", return_value=0

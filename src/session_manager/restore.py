@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -12,7 +13,7 @@ from collections.abc import Iterator
 from functools import partial
 from typing import Any
 
-from .apps.generic import launch_and_get_id
+from .apps.generic import launch_and_get_id, window_with_pid
 from .apps.handlers import handler_for
 from .apps.helium import (
     collect_helium_nodes,
@@ -22,6 +23,8 @@ from .apps.helium import (
 from .apps.kitty import classify_kitty
 from .background import restore_background_apps
 from .config import (
+    APP_PROFILES,
+    DEFAULT_APP_PROFILE,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     RESTORE_STAGING_WORKSPACE,
@@ -76,6 +79,11 @@ _LAYOUTS: dict[str, frozenset[str]] = {
 # rects stop changing, so the request is seen before the geometry is judged.
 _GEOMETRY_SETTLE_TIMEOUT = 2.0
 _GEOMETRY_POLL_INTERVAL = 0.05
+
+# An application can replace the window that it maps. The restore reads the
+# tree repeatedly until the containers do not change. A container that dies
+# while its process lives is given this time to be replaced.
+_PLACEMENT_SETTLE_TIMEOUT = 2.0
 
 
 def _quote_token(name: str) -> str:
@@ -273,7 +281,168 @@ def _run_launch_unit(nodes: list[dict], ctx: RestoreContext) -> None:
             log.exception("Failed to launch %s", _failure_label(node))
             ctx.add_failure(f"{_failure_label(node)}: {exc}")
             win_id = None
-        ctx.registry.record(node, win_id)
+        ctx.registry.record(node, win_id, pid=_launched_window_pid(win_id))
+
+
+def _launched_window_pid(win_id: int | None) -> int | None:
+    """Return the pid of the window that the launch bound.
+
+    The restore must read the pid while the window is in the tree. An
+    application can replace its window. The pid of the replacement window
+    stays the same.
+    """
+    if not win_id:
+        return None
+    try:
+        tree = get_tree()
+    except OSError:
+        return None
+    for node in walk_tree(tree):
+        if node.get("id") != win_id:
+            continue
+        if node.get("type") not in ("con", "floating_con"):
+            return None
+        pid = node_pid(node)
+        return pid if pid > 0 else None
+    return None
+
+
+def _rebind_window(
+    node: dict, win_id: int, pid: int, replacement: int, ctx: RestoreContext
+) -> None:
+    """Bind one saved node to the live window that replaced its window.
+
+    The claim set moves with the bind. Thus no other saved node can claim
+    the replacement window.
+    """
+    ctx.claimed_ids.discard(win_id)
+    ctx.claimed_ids.add(replacement)
+    ctx.registry.rebind(node, replacement)
+    log.info(
+        "Re-bound %s from gone container %d to %d (pid %d)",
+        _failure_label(node),
+        win_id,
+        replacement,
+        pid,
+    )
+
+
+def _await_replacements(
+    pending: dict[int, list[tuple[dict, int]]], ctx: RestoreContext
+) -> int:
+    """Wait for the live processes to map the replacement windows.
+
+    An application can destroy the window that the launch bound. The
+    application maps the window that the session saved a short time later.
+    The replacement window has the same pid.
+
+    The wait stops when one of these conditions occurs:
+      * The process of a pending pid does not live.
+      * The replacement windows are found.
+      * The deadline is reached.
+
+    Args:
+        pending: The live pids and the saved nodes of the dead containers.
+        ctx: The restore context that holds the registry and the claim set.
+
+    Returns:
+        The number of nodes that this function bound again.
+    """
+    deadline = time.monotonic() + _PLACEMENT_SETTLE_TIMEOUT
+    rebound = 0
+    while pending:
+        if not any(_pid_is_alive(pid) for pid in pending):
+            return rebound
+        try:
+            tree = get_tree()
+        except OSError:
+            return rebound
+        for pid in list(pending):
+            remaining: list[tuple[dict, int]] = []
+            for node, win_id in pending[pid]:
+                app_id = canonical_app_id(node_app_id(node))
+                replacement = window_with_pid(pid, app_id, tree)
+                if replacement is None or replacement in ctx.claimed_ids:
+                    remaining.append((node, win_id))
+                    continue
+                _rebind_window(node, win_id, pid, replacement, ctx)
+                rebound += 1
+            if remaining:
+                pending[pid] = remaining
+            else:
+                del pending[pid]
+        if time.monotonic() >= deadline:
+            return rebound
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
+    return rebound
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Report whether the pid names a live process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _rebind_dead_windows(nodes: list[dict], ctx: RestoreContext) -> int:
+    """Bind the saved nodes to the windows that replaced the bound windows.
+
+    An application can map a placeholder window and destroy it. The
+    application maps the window that the session saved under the same pid.
+    The launch wait binds the placeholder. Each later `[con_id=]` command
+    fails with `No matching node.`. The pid that the launch recorded finds
+    the replacement window.
+
+    A container can die a short time before the application maps the
+    replacement. This function waits for those replacements.
+
+    Args:
+        nodes: The saved nodes to bind again.
+        ctx: The restore context that holds the registry and the claim set.
+
+    Returns:
+        The number of nodes that this function bound again.
+    """
+    bound: list[tuple[dict, int, int]] = []
+    for node in nodes:
+        if not ctx.registry.has(node):
+            continue
+        win_id = ctx.registry.resolve(node)
+        pid = ctx.registry.pid(node)
+        if win_id and pid:
+            bound.append((node, win_id, pid))
+    if not bound:
+        return 0
+    try:
+        tree = get_tree()
+    except OSError:
+        return 0
+    live_ids = {
+        node.get("id")
+        for node in walk_tree(tree)
+        if node.get("type") in ("con", "floating_con")
+    }
+    rebound = 0
+    pending: dict[int, list[tuple[dict, int]]] = {}
+    for node, win_id, pid in bound:
+        if win_id in live_ids:
+            continue
+        app_id = canonical_app_id(node_app_id(node))
+        replacement = window_with_pid(pid, app_id, tree)
+        if replacement is None:
+            pending.setdefault(pid, []).append((node, win_id))
+            continue
+        if replacement in ctx.claimed_ids:
+            continue
+        _rebind_window(node, win_id, pid, replacement, ctx)
+        rebound += 1
+    return rebound + _await_replacements(pending, ctx)
 
 
 def _start_materialization(
@@ -293,6 +462,10 @@ def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
     group restores alongside the other launches, and placement still waits
     for it: a window that maps while the walk is issuing `split` or `layout`
     can steal focus and reshape the wrong container.
+
+    A window whose container died during the launches is bound to the
+    replacement window before anything is placed. Thus the walk does not
+    place a container id that is already gone.
     """
     pending = [node for node in nodes if not ctx.registry.has(node)]
     helium = _start_helium_materialization(ctx)
@@ -301,6 +474,7 @@ def _materialize(nodes: list[dict], ctx: RestoreContext) -> None:
         event.wait()
     if helium is not None:
         helium.wait()
+    _rebind_dead_windows(nodes, ctx)
 
 
 def _run_helium_unit(ctx: RestoreContext) -> None:
@@ -486,14 +660,6 @@ def _live_window_placements(tree: dict) -> dict[int, str | None]:
     return placements
 
 
-def _read_window_placements() -> dict[int, str | None] | None:
-    """Return live window placements, or None when the tree is unreadable."""
-    try:
-        return _live_window_placements(get_tree())
-    except OSError:
-        return None
-
-
 def _placed_window_id(node: dict, ctx: RestoreContext) -> int | None:
     """Return the live id of a saved node that went through materialization."""
     if not ctx.registry.has(node):
@@ -511,14 +677,30 @@ def _reconcile_placements(
     arranged. One pass over the live tree repairs those windows by con id
     and verifies the repair, so a partly healed session converges instead of
     reporting success with windows in the wrong place.
+
+    The pass also binds a saved node again when its container died. An
+    application can replace its window at any time. The window that is in
+    the tree is the window that the pass must put back. If the pass does not
+    bind the node again, the saved window is reported as missing. The
+    replacement window stays on a different workspace. The rebind runs
+    before the pass reads the placements. Thus the pass judges the window
+    that is in the tree.
     """
-    placements = _read_window_placements()
-    if placements is None:
+    saved_windows = [
+        window for workspace in workspaces for window in _iter_windows(workspace)
+    ]
+    saved_windows.extend(
+        window for node in hidden_scratchpad for window in _iter_windows(node)
+    )
+    _rebind_dead_windows(saved_windows, ctx)
+    try:
+        tree = get_tree()
+    except OSError:
         ctx.placements = None
         return
     # The reconcile pass works from a fresh tree, so the cached
     # placements have to match it.
-    ctx.placements = placements
+    ctx.placements = placements = _live_window_placements(tree)
 
     moved: dict[int, tuple[dict, str]] = {}
     for workspace in workspaces:
@@ -551,8 +733,9 @@ def _reconcile_placements(
 
     if not moved:
         return
-    after = _read_window_placements()
-    if after is None:
+    try:
+        after = _live_window_placements(get_tree())
+    except OSError:
         return
     for win_id, (node, name) in moved.items():
         if win_id not in after:
@@ -565,6 +748,96 @@ def _reconcile_placements(
                 f"expected {name!r}"
             )
     log.info("Reconciled %d misplaced window(s)", len(moved))
+
+
+def _app_settle(node: dict) -> float:
+    """Return the settle time of the application that owns the node.
+
+    Returns:
+        The time in seconds that a mapped window of this application must
+        stay in the tree before the launch wait accepts it.
+    """
+    profile = APP_PROFILES.get(canonical_app_id(node_app_id(node)), DEFAULT_APP_PROFILE)
+    return float(profile["settle"])
+
+
+def _young_windows(placed: list[tuple[dict, int]], ctx: RestoreContext) -> bool:
+    """Report whether a placed window was bound recently.
+
+    An application can replace a window a short time after it maps the
+    window. A young window is given two times its settle time before the
+    restore asserts the placement. Thus the restore sees the replacement.
+
+    A window that the restore adopted is not young. Its application is past
+    the time when it can replace the window.
+
+    Args:
+        placed: The saved nodes and the ids of their live windows.
+        ctx: The restore context that holds the registry.
+
+    Returns:
+        True when a placed window is still young.
+    """
+    for node, _win_id in placed:
+        age = ctx.registry.age(node)
+        if age is None:
+            continue
+        if age < 2 * _app_settle(node):
+            return True
+    return False
+
+
+def _await_stable_placements(
+    workspaces: list[dict], hidden_scratchpad: list[dict], ctx: RestoreContext
+) -> None:
+    """Wait until the containers of the restored windows do not change.
+
+    An application can replace the window that the walk placed. A placement
+    that the restore asserts before the replacement can be wrong. This
+    function reads the live ids of the placed windows repeatedly. It stops
+    when two reads agree and when no window is young.
+
+    The wait has a deadline. The wait stops immediately when the restore
+    placed no window. The caller keeps the focus on the staging workspace.
+    Thus a window that maps during the wait can be recovered from there.
+
+    Args:
+        workspaces: The saved workspaces of this restore.
+        hidden_scratchpad: The saved scratchpad entries of this restore.
+        ctx: The restore context that holds the registry.
+    """
+    placed = [
+        (node, win_id)
+        for node, _workspace, _floating in _saved_window_targets(
+            workspaces, hidden_scratchpad
+        )
+        if (win_id := _placed_window_id(node, ctx)) is not None
+    ]
+    if not placed:
+        return
+    deadline = time.monotonic() + _PLACEMENT_SETTLE_TIMEOUT
+    previous: tuple[int, ...] | None = None
+    while True:
+        try:
+            tree = get_tree()
+        except OSError:
+            return
+        live_ids = {
+            node.get("id")
+            for node in walk_tree(tree)
+            if node.get("type") in ("con", "floating_con")
+        }
+        state = tuple(win_id for _node, win_id in placed if win_id in live_ids)
+        if (
+            previous is not None
+            and state == previous
+            and not _young_windows(placed, ctx)
+        ):
+            return
+        previous = state
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(_GEOMETRY_POLL_INTERVAL)
 
 
 def _saved_window_targets(
@@ -779,14 +1052,24 @@ def _finish_staging(
     window that maps while it is running lands on the staging workspace and
     is found there instead of on the destination. The sweep runs before the
     switch to the destination.
+
+    The restored windows are first given time to stop the changes to the
+    containers. An application can replace a placed window a short time
+    after the walk places it. The passes that follow assert the placement of
+    the window that is in the tree. They run on each restore. A staging
+    workspace that is already empty is not a cause to skip the last
+    assertion.
     """
     # `_iter_windows` is a generator, so `any` has to see the windows it
     # yields rather than the (always truthy) generator objects themselves.
     if any(list(_iter_windows(workspace)) for workspace in workspaces):
         _focus_staging(ctx)
-    if _staging_workspace_names():
-        _recover_late_windows(workspaces, hidden_scratchpad, ctx)
-        _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+    _await_stable_placements(workspaces, hidden_scratchpad, ctx)
+    # The reconciliation runs before the recovery. A window whose container
+    # died is bound to the replacement first. Thus the sweep does not report
+    # it as a window that matches no saved window.
+    _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+    _recover_late_windows(workspaces, hidden_scratchpad, ctx)
     focused = cmd(_workspace_cmd(destination))
     if not focused:
         ctx.add_failure(f"could not focus destination workspace {destination!r}")
@@ -1919,8 +2202,12 @@ def _restore_session_locked(
         # after the walk places them, and an interrupted restore leaves some
         # of them elsewhere; this pass moves them back by con id and verifies
         # the result before the session is reported as restored.
-        _recover_late_windows(workspaces, hidden_scratchpad, ctx)
+        #
+        # The reconciliation runs before the recovery. A window whose
+        # container died is bound to the replacement first. Thus the sweep
+        # does not report it as a window that matches no saved window.
         _reconcile_placements(workspaces, hidden_scratchpad, ctx)
+        _recover_late_windows(workspaces, hidden_scratchpad, ctx)
 
         # An application asks for its own size right after it maps, and that
         # request can land after the walk placed the window. The floating

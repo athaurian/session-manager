@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator, MutableSet
 from concurrent.futures import ThreadPoolExecutor
 
@@ -68,6 +69,8 @@ class WindowRegistry:
         self._lock = threading.Lock()
         self._events: dict[int, threading.Event] = {}
         self._results: dict[int, int | None] = {}
+        self._pids: dict[int, int] = {}
+        self._times: dict[int, float] = {}
         self._pool = ThreadPoolExecutor(
             max_workers=MATERIALIZE_WORKERS, thread_name_prefix="session-materialize"
         )
@@ -97,10 +100,49 @@ class WindowRegistry:
         self._pool.submit(run)
         return done
 
-    def record(self, node: dict, win_id: int | None) -> None:
-        """Record the live id assigned to a saved node."""
+    def record(self, node: dict, win_id: int | None, pid: int | None = None) -> None:
+        """Record the live id assigned to a saved node.
+
+        `pid` is the pid of the window that the launch bound. An application
+        can replace its window, but the pid of the new window stays the
+        same. The pid therefore finds the replacement window.
+        """
         with self._lock:
             self._results[id(node)] = win_id
+            self._times[id(node)] = time.monotonic()
+            if pid:
+                self._pids[id(node)] = pid
+
+    def pid(self, node: dict) -> int | None:
+        """Return the pid recorded for a node's window, or None."""
+        with self._lock:
+            return self._pids.get(id(node))
+
+    def age(self, node: dict) -> float | None:
+        """Return the time since the launch bound the node's window.
+
+        Returns:
+            The time in seconds, or None when a launch did not bind the
+            node. A window that the restore adopted from the live tree has
+            no bind time. Its application is past the time when it can
+            replace its window.
+        """
+        with self._lock:
+            bound_at = self._times.get(id(node))
+        if bound_at is None:
+            return None
+        return time.monotonic() - bound_at
+
+    def rebind(self, node: dict, win_id: int) -> None:
+        """Bind a saved node to a different live window.
+
+        The recorded pid stays the same. Only the container id changes. The
+        bind time is renewed, because the replacement window has only just
+        mapped.
+        """
+        with self._lock:
+            self._results[id(node)] = win_id
+            self._times[id(node)] = time.monotonic()
 
     def adopt(self, node: dict, win_id: int) -> None:
         """Bind a saved node to a live window that is already there.

@@ -197,9 +197,23 @@ def wait_for_app_window(
     )
 
 
-def _window_with_pid(pid: int, app_id: str) -> int | None:
-    """Return a live window owned by pid, or None."""
-    for n in walk_tree(get_tree()):
+def window_with_pid(pid: int, app_id: str, tree: dict | None = None) -> int | None:
+    """Return the id of the live window that `pid` owns, or None.
+
+    A caller can supply the tree that it has read already. This prevents a
+    second read of the tree.
+
+    Args:
+        pid: The pid of the process that owns the window.
+        app_id: The app identity that the window must have.
+        tree: A tree that the caller read already, or None to read one.
+
+    Returns:
+        The id of the window, or None when no window matches.
+    """
+    if tree is None:
+        tree = get_tree()
+    for n in walk_tree(tree):
         if (
             n.get("type") in ("con", "floating_con")
             and node_pid(n) == pid
@@ -244,12 +258,12 @@ def wait_for_window_by_pid(
 
         now = time.monotonic()
         if now >= next_scan:
-            found = _window_with_pid(pid, app_id)
+            found = window_with_pid(pid, app_id)
             if found is not None:
                 return found
             next_scan = now + WINDOW_TREE_SCAN_INTERVAL
 
-    return _window_with_pid(pid, app_id)
+    return window_with_pid(pid, app_id)
 
 
 def launch_and_get_id(node: dict, claimed_ids: MutableSet[int]) -> int | None:
